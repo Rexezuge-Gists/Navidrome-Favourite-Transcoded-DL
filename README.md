@@ -1,11 +1,16 @@
 # navidrome_favsync
 
-Download your [Navidrome](https://www.navidrome.org) library as Opus files,
-transcoded on the server to a bitrate you choose. The whole library is mirrored
-by default; `--favorites-only` narrows it to the tracks you've starred.
+Download tracks from your [Navidrome](https://www.navidrome.org) server as Opus
+files, transcoded on the server to a bitrate you choose.
 
-- Walks every album in the library and saves tracks as `Artist - Album/NN - Title.opus`
-- `--favorites-only` downloads just your starred tracks instead
+Run it in a terminal and it shows you what it found and asks which tracks you
+want — so grabbing three songs is the easy case, not the whole library. In a
+pipe, a script or cron there is nobody to ask, so it takes everything.
+
+- **Picks the tracks for you**: an interactive list in a terminal, or name them
+  up front with `--search`, `--song-id`, `--artist`, `--album` or
+  `--favorites-only`
+- Walks every album and saves tracks as `Artist - Album/NN - Title.opus`
 - Asks the server for a real Opus transcode, and **refuses** to save a FLAC wearing
   an `.opus` extension
 - Saves a `cover.jpg` per album *and* embeds the artwork into each `.opus` file
@@ -15,6 +20,7 @@ by default; `--favorites-only` narrows it to the tracks you've starred.
 
 No dependencies. Python 3.9+ standard library only — no `pip install`, no
 `requests`, no `ffmpeg` on your machine.
+
 
 ---
 
@@ -52,17 +58,7 @@ optional and only needed if you want to run the test suite.
 
 ## Quick start
 
-Try it without writing anything:
-
-```bash
-./navidrome_favsync.py \
-  --url https://navi.550441.xyz \
-  --user test \
-  --password 'your-password' \
-  --dry-run
-```
-
-Then for real:
+Run it and pick what you want:
 
 ```bash
 ./navidrome_favsync.py \
@@ -70,6 +66,21 @@ Then for real:
   --user test \
   --password 'your-password' \
   --out ~/Music
+```
+
+```
+1  01     Miles Davis - So What       Kind of Blue      9:22    0rVIJb7CSgetU1nTv0ARaF
+2  02     Miles Davis - Blue in Green Kind of Blue      5:37    kT9X2pLmQ8vRbYhNcW1sZ
+3  01     Radiohead - Airbag          OK Computer       4:44    Zx4LmNbVcXqWeRtYuIoP2a
+
+3 candidate(s). Which to download? [e.g. 2,5-7, 1-3, all, none, q]
+```
+
+Take everything, without being asked — this is also what a pipe or a cron job
+does automatically:
+
+```bash
+./navidrome_favsync.py --url https://navi.550441.xyz --user test --password 'pw' --out ~/Music --all
 ```
 
 Keeping the password out of your shell history and out of `ps` output is nicer:
@@ -81,12 +92,6 @@ export ND_PASSWORD='your-password'      # or: read -rs ND_PASSWORD
 ./navidrome_favsync.py --out ~/Music
 ```
 
-Just the starred tracks, as before:
-
-```bash
-./navidrome_favsync.py --favorites-only --out ~/Music/favorites
-```
-
 A scheduled sync, e.g. nightly at 4am:
 
 ```cron
@@ -94,10 +99,95 @@ A scheduled sync, e.g. nightly at 4am:
            /path/to/navidrome_favsync.py --out /srv/music >> /var/log/favsync.log 2>&1
 ```
 
+## Choosing which tracks to download
+
+A run asks for **one scope** — one answer to "which tracks?" — and separately
+answers "should I ask?":
+
+| Scope | What it downloads | Needs a library scan? |
+|---|---|---|
+| *(none)* | The whole library | yes |
+| `--search QUERY` | Every track the server matches on title/artist/album | **no** |
+| `--song-id ID` | Exactly the tracks with those Navidrome ids | **no** |
+| `--artist TEXT` | Every track whose artist contains `TEXT` | yes |
+| `--album TEXT` | Every track whose album contains `TEXT` | yes |
+| `--favorites-only` | Your starred tracks | no |
+
+Two scopes at once is an error — including `--artist` with `--album` — so a
+command never means two different things.
+
+| Asking | Meaning |
+|---|---|
+| *(nothing)* | Ask if there is a terminal; take everything if there isn't |
+| `--pick` | Always ask, and **fail** rather than take everything if there isn't a terminal |
+| `--all` | Never ask |
+
+`--pick` and `--all` compose with a scope, which is what makes *search, then
+choose from the hits* a single command:
+
+```bash
+# Search the server, then choose from the hits
+./navidrome_favsync.py --search "kind of blue" --pick --out ~/Music
+
+# Just the search hits, no questions asked
+./navidrome_favsync.py --search "reol" --out ~/Music
+
+# One specific song, by the id the prompt or manifest shows you
+./navidrome_favsync.py --song-id 0rVIJb7CSgetU1nTv0ARaF --out ~/Music
+
+# Several at once, in one command
+./navidrome_favsync.py --song-id 0rVIJb7CSgetU1nTv0ARaF,kT9X2pLmQ8vRbYhNcW1sZ --out ~/Music
+
+# Everything by one artist, case-insensitively, matching anywhere in the name
+./navidrome_favsync.py --artist "radiohead" --all --out ~/Music
+```
+
+`--search` and `--song-id` are the fast ones: the server already knows which
+tracks match, so neither walks the library. That is what makes them usable on a
+library far too big to enumerate, and in a cron job.
+
+`--artist` and `--album` are substring matches against the enumerated library, so
+they do walk it. They are there for "everything by this artist", and for narrowing
+the list before you pick.
+
+### At the prompt
+
+Answer with track numbers, ranges, or one of the words:
+
+| You type | It means |
+|---|---|
+| `2` | track 2 |
+| `2,5` or `2 5` | tracks 2 and 5 |
+| `2-7` | tracks 2 through 7 |
+| `2,5-7,9` | any mix of the above |
+| `all` | every candidate — same as `--all` |
+| `none` | nothing; the run exits cleanly having done nothing |
+| `q`, `quit`, or `Ctrl-D` | the same |
+
+Anything else is rejected and you are asked again rather than guessed at, because
+guessing here would download the wrong songs.
+
+Long lists are shown 200 rows at a time — press Enter for the next page. Nothing
+is ever hidden: every candidate is listed, so everything is selectable.
+
+### Finding song ids
+
+The prompt and `manifest.jsonl` both show ids, and that is all you need:
+
+```bash
+# which ids does this run care about?
+jq -r 'select(.status=="downloaded") | "\(.id)  \(.artist) - \(.title)"' music/manifest.jsonl
+
+# or copy one off the interactive list
+./navidrome_favsync.py --search "so what" --all --out ~/Music
+```
+
 ## What gets downloaded
 
-By default: **every track in every album the account can see**. The script
-enumerates the library before downloading anything:
+Which tracks is up to you — see [Choosing which tracks to
+download](#choosing-which-tracks-to-download). This is how the whole library is
+enumerated, which is what the default, `--all`, `--pick`, `--artist` and
+`--album` all rely on:
 
 1. `getAlbumList2` with `type=alphabeticalByName` pages through the albums, 500
    at a time
@@ -107,6 +197,10 @@ So the scan costs one extra small JSON request per album, negligible next to
 streaming a full transcode of every track. What it buys is completeness:
 `getAlbum` returns a whole album in a single response, so a big library can't
 lose tracks to a paging gap the way paging songs by offset can.
+
+`--search` and `--song-id` skip the walk entirely: they ask the server for the
+tracks directly, so they stay instant however big the library is. So does
+`--favorites-only`, which uses `getStarred2`.
 
 A few things worth knowing about a large library:
 
@@ -118,10 +212,12 @@ A few things worth knowing about a large library:
 - Albums added *while* a long run is in progress may fall into a shifted page and
   be missed. Run it again; already-downloaded tracks are skipped, so that's cheap
 - `--limit N` stops the scan as soon as `N` tracks have been collected, so
-  `--limit 1` doesn't walk the whole library
+  `--limit 1` doesn't walk the whole library. It does **not** apply to the
+  interactive list (you would be choosing from an incomplete list) or to
+  `--artist`/`--album` (a filter that never saw every album would answer a
+  different question); in both cases `--limit` is applied to the tracks you end
+  up with
 
-`--favorites-only` uses `getStarred2` instead and downloads the starred tracks
-only, which is instant regardless of library size.
 
 ## What you get
 
@@ -169,11 +265,18 @@ Use `--no-embed` to keep `cover.jpg` but leave the `.opus` files alone, or
 | `--user` | `$ND_USERNAME` | Username (alias: `--username`) |
 | `--password` | `$ND_PASSWORD` | Password. Prefer the env var |
 | `--out DIR` | `./music` | Where to write files |
-| `--favorites-only` | off | Download only starred tracks instead of the whole library |
+| `--favorites-only` | off | Scope: download only starred tracks |
+| `--song-id ID` | — | Scope: download these exact song ids. Repeatable, or comma-separated |
+| `--search QUERY` | — | Scope: download every track the server matches |
+| `--artist TEXT` | — | Scope: download tracks whose artist contains `TEXT` |
+| `--album TEXT` | — | Scope: download tracks whose album contains `TEXT` |
+| `--pick` | off | Ask which of the candidates to download; fail without a terminal |
+| `--all` | off | Never ask; take every candidate track |
 | `--format` | `opus` | Target format to request (see Limitations) |
 | `--bitrate` | `192` | Target bitrate in kbps, 6–256 |
 | `--workers N` | `1` | Parallel downloads. Each spawns an ffmpeg transcode **on the server** |
 | `--retries N` | `5` | Attempts per track, not per request |
+
 | `--timeout` | `60` | Socket timeout in seconds |
 | `--cover-size` | `1000` | Cover art edge size in pixels |
 | `--no-cover` | off | Don't fetch or save artwork |
@@ -230,9 +333,10 @@ workers don't resynchronise into a thundering herd.
 ### Sample run
 
 Real output, with the server line from a live run against Navidrome 0.64.2 and the
-rest captured from the test suite. The scan logs every 25 albums, so a three-album
-library stays quiet. Track 2 hits the server's concurrent-transcode limit and
-recovers; track 3 hits the misconfiguration described above.
+rest captured from the test suite. This is a terminal run with `--all`, so
+nothing is asked. The scan logs every 25 albums, so a three-album library stays
+quiet. Track 2 hits the server's concurrent-transcode limit and recovers; track 3
+hits the misconfiguration described above.
 
 ```
 12:15:09 INFO    Connected to https://navi.550441.xyz (Navidrome 0.64.2, API navidrome)
@@ -272,17 +376,17 @@ immediately without waiting for the summary.
 12:14:09 INFO    Done: 0 downloaded, 0 skipped, 1 failed (of 4)
 ```
 
-During the library scan, which happens before any download, `Ctrl-C` instead
-prints `Aborted while listing tracks` and exits `130`.
+During the library scan, or at the selection prompt, which both happen before any
+download, `Ctrl-C` instead prints `Aborted while listing tracks` and exits `130`.
 
 ## Exit codes
 
 | Code | Meaning |
 |---|---|
-| `0` | Everything succeeded (or nothing to do) |
-| `1` | At least one track failed — including the track interrupted by `Ctrl-C`, or an album that couldn't be listed |
-| `2` | Couldn't start: bad arguments, wrong credentials, server unreachable, album list unavailable |
-| `130` | Force-aborted with a second `Ctrl-C`, or during the library scan |
+| `0` | Everything succeeded, or there was nothing to download (including `none` at the prompt) |
+| `1` | At least one track failed — including the track interrupted by `Ctrl-C`, an album that couldn't be listed, or a `--song-id` that couldn't be read |
+| `2` | Couldn't start: bad arguments, two scopes at once, no `--song-id` that resolved, `--pick` without a terminal, wrong credentials, server unreachable, album list unavailable |
+| `130` | Force-aborted with a second `Ctrl-C`, or during the library scan or the selection prompt |
 
 Useful in scripts: `navidrome_favsync.py ... || echo "some tracks failed, see the log"`.
 
@@ -345,13 +449,47 @@ folder, and that the server has finished scanning it.
 Only possible with `--favorites-only`: the account genuinely has nothing starred.
 Star something in Navidrome and try again.
 
+**`--pick needs a terminal to ask on`**
+
+`--pick` insists on asking, so a cron job or a pipe fails instead of quietly
+downloading everything. Either drop `--pick` (an unattended run takes everything
+anyway) or say what you want up front: `--search`, `--artist`, `--album` or
+`--song-id`.
+
+**`choose one scope, not several`**
+
+Each run asks for one thing, and two of `--favorites-only`, `--song-id`,
+`--search`, `--artist` or `--album` is a mistake rather than a combination —
+including `--artist` with `--album`. Pick the one that matters. `--pick` and
+`--all` are not scopes, so either may be added to any of them.
+
+**`none of the requested song ids could be read`**
+
+Every id you passed was rejected. Ids come from Navidrome and change if the
+library is rescanned or the file replaced, so check the spelling against
+`manifest.jsonl` or the interactive list. One bad id among several is not fatal:
+the rest download and the run exits `1`.
+
+**`no track matched '...'`**
+
+Exit `0`, nothing downloaded: the server found nothing for that query. It is
+Navidrome's own search, so it matches words and prefixes rather than arbitrary
+substrings — search for fewer, more distinctive words, or filter locally with
+`--artist`/`--album` instead.
+
+**`no track in the library has ...`**
+
+Same idea, for a `--artist`/`--album` filter. Those are substring matches against
+the enumerated library, so check the spelling — and remember they walk the whole
+library, so `--search` is faster when you only need to find it.
+
 **A full run spends a long time before the first download**
 
 That's the library scan — one `getAlbum` request per album, every album in the
 library, including the ones you've already downloaded. It's only slow the first
 time: `Enumerated 500 album(s), 7421 track(s) so far` tells you where it is. Use
-`--limit N` to take a short sample, or `--favorites-only` if you only want the
-starred tracks.
+`--limit N` to take a short sample, `--search` or `--song-id` to skip the walk
+entirely, or `--favorites-only` if you only want the starred tracks.
 
 **Tracks are skipped with no title, or `Unknown Title` everywhere**
 
@@ -384,6 +522,8 @@ there is no native streaming endpoint — so the script speaks Subsonic end to e
 | `getAlbumList2` | Page through every album the account can see |
 | `getAlbum` | The tracks of one album |
 | `getStarred2` | Your favorite tracks, with `--favorites-only` |
+| `getSong` | One track's metadata, with `--song-id` |
+| `search3` | Search by title/artist/album, with `--search` |
 | `getCoverArt` | One cover per album, reused across its tracks |
 | `stream` | The audio, with `format=opus&maxBitRate=192` |
 
@@ -416,6 +556,13 @@ makes a *complete* file structurally distinguishable from a cut-off one.
 - **Multi-library accounts get everything they're allowed to see.** There's no
   `--music-folder` to pick one library; the scan covers all of them.
 - **Not a two-way sync.** Nothing is ever un-favorited or deleted on the server.
+- **`--search` uses Navidrome's matching, not yours.** It matches words and
+  prefixes, so `--search "air"` won't find "Airbag" on every server.
+  `--artist`/`--album` are true substring matches, at the cost of walking the
+  library.
+- **One scope per run.** No `--artist` *and* `--album`, and no
+  `--favorites-only --search`; that is deliberate, not an oversight. `--pick` and
+  `--all` are exempt: they are about asking, not about which tracks.
 
 ## Tests
 
@@ -423,7 +570,7 @@ makes a *complete* file structurally distinguishable from a cut-off one.
 python3 -m unittest test_navidrome_favsync -v
 ```
 
-106 tests, no network access required, about 10 seconds. They cover:
+174 tests, no network access required, about 15 seconds. They cover:
 
 - The Ogg CRC against an independent bitwise reference **and** against real `.oga`
   files from the system sound theme
@@ -435,6 +582,18 @@ python3 -m unittest test_navidrome_favsync -v
   tracks skipped, `--limit` stopping the scan early, an unreadable album skipped
   while the run reports exit code `1`, and `--favorites-only` never touching the
   album endpoints
+- Track selection end to end: `--song-id` resolving single, repeated,
+  comma-joined, unknown and non-trackable ids without ever calling the album
+  endpoints; paged `search3`; `--artist`/`--album` substring filters
+- The interactive prompt in a terminal: chosen tracks only, `all`, `q`, `Ctrl-D`,
+  a bad answer re-asked, `--all` asking nothing, `--pick` refusing without a
+  terminal, `--search ... --pick` offering only the hits, 200-row pagination of a
+  450-track list, and never prompting for an explicit `--song-id` or an empty
+  scope
+- The selection grammar itself — ranges, reversed ranges, repeats, `0` not
+  wrapping round to the last track, and every rejected answer
+- The candidate table staying aligned when titles are CJK, which are one
+  character but two terminal columns
 - A mock Navidrome server that misbehaves on cue: 429s, lying `Content-Length`,
   mid-transfer disconnects, HTTP 200 carrying an error document, empty bodies,
   and streaming the original file instead of a transcode

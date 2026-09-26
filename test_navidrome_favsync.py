@@ -17,6 +17,7 @@ Run with:  python3 -m unittest -v test_navidrome_favsync
 
 from __future__ import annotations
 
+import contextlib
 import glob
 import hashlib
 import http.server
@@ -30,6 +31,7 @@ import time
 import unittest
 import urllib.parse
 from pathlib import Path
+from unittest import mock
 
 import navidrome_favsync as navi
 
@@ -848,6 +850,8 @@ class MockNavidromeHandler(http.server.BaseHTTPRequestHandler):
             "getStarred2": self._handle_starred,
             "getAlbumList2": self._handle_album_list2,
             "getAlbum": self._handle_album,
+            "getSong": self._handle_song,
+            "search3": self._handle_search3,
             "getCoverArt": self._handle_cover,
             "stream": self._handle_stream,
         }.get(endpoint)
@@ -906,6 +910,61 @@ class MockNavidromeHandler(http.server.BaseHTTPRequestHandler):
             self._subsonic_ok({"album": payload})
             return
         self._subsonic_failed(70, "Album not found", status=404)
+
+    def all_songs(self):
+        """Every track the mock knows about, from the library and every album."""
+        songs = [song_entry(song_id, title, track) for song_id, title, track in self.state["library"]]
+        for album in self.state["albums"]:
+            songs.extend(album["songs"])
+        seen = set()
+        unique = []
+        for song in songs:
+            if song["id"] in seen:
+                continue
+            seen.add(song["id"])
+            unique.append(song)
+        return unique
+
+    def _handle_song(self, params):
+        song_id = params.get("id", "")
+        behaviour = self.state["behaviours"].get(f"song:{song_id}")
+        if behaviour == "server-error":
+            self._subsonic_failed(0, "Internal Server Error: boom", status=500)
+            return
+        for song in self.all_songs():
+            if song["id"] == song_id:
+                # getSong answers with a bare object, not a list.
+                self._subsonic_ok({"song": song})
+                return
+        self._subsonic_failed(70, "Song not found", status=404)
+
+    def _handle_search3(self, params):
+        query = (params.get("query") or "").casefold()
+        try:
+            count = int(params.get("songCount", 20))
+            offset = int(params.get("songOffset", 0))
+        except ValueError:
+            self._subsonic_failed(10, "songCount/songOffset must be integers")
+            return
+        matches = []
+        for song in self.all_songs():
+            haystack = " ".join(
+                str(song.get(key) or "") for key in ("title", "album", "artist")
+            ).casefold()
+            if query in haystack:
+                matches.append(song)
+        window = matches[offset : offset + count]
+        self._subsonic_ok(
+            {
+                "searchResult3": {
+                    "song": window,
+                    # Real search3 also returns matching artists and albums, which
+                    # are not streams and must be ignored.
+                    "artist": [{"id": "ar-1", "name": "Fixture Artist"}],
+                    "album": [{"id": "al-1", "name": "Fixture Album"}],
+                }
+            }
+        )
 
     def _handle_cover(self, params):
         if params.get("size") != str(self.state["cover_size"]):
@@ -1098,6 +1157,12 @@ class EndToEndTestCase(unittest.TestCase):
 
     def setUp(self):
         self.pending_behaviours = {}
+        # A run with a terminal asks which tracks to download, so every test here
+        # must look like an unattended one -- including when the suite itself is
+        # started from a terminal, where stdin really is a tty.
+        tty = mock.patch.object(navi, "_stdin_is_tty", return_value=False)
+        tty.start()
+        self.addCleanup(tty.stop)
 
     def run_script(self, out_dir, *extra):
         self.server.reset(self.pending_behaviours)
@@ -1388,6 +1453,538 @@ class TestFavoritesOnlyHappyPath(EndToEndTestCase):
         self.assertEqual(len(list(out.rglob("*.opus"))), 1)
 
 
+# ---------------------------------------------------------------------------
+# 7. Choosing tracks
+# ---------------------------------------------------------------------------
+
+
+class SelectionTestCase(EndToEndTestCase):
+    """Base for the scope tests: two albums, three tracks, one starred track."""
+
+    library = (("star-1", "Starred Only", 1),)
+    albums = multi_album_fixture()
+
+    def endpoints(self):
+        return [endpoint for endpoint, _params in self.server.state["requests"]]
+
+    def streamed(self):
+        return [song_id for song_id, _fmt, _bitrate in self.server.state["stream_params"]]
+
+
+class TestSongIdSelection(SelectionTestCase):
+    def test_one_id_downloads_only_that_track(self):
+        out = self.temp_dir()
+        self.assertEqual(self.run_script(out, "--song-id", "ok-2"), 0)
+
+        self.assertTrue((out / "Artist One - First Album" / "02 - One Two.opus").is_file())
+        self.assertEqual(len(list(out.rglob("*.opus"))), 1)
+        self.assertEqual(self.streamed(), ["ok-2"])
+
+    def test_no_library_scan_is_needed(self):
+        out = self.temp_dir()
+        self.assertEqual(self.run_script(out, "--song-id", "ok-3"), 0)
+        # The point of --song-id: instant, even on a library too big to walk.
+        for endpoint in ("getAlbumList2", "getAlbum", "getStarred2"):
+            self.assertNotIn(endpoint, self.endpoints(), f"{endpoint} must not be called")
+        self.assertEqual(self.endpoints().count("getSong"), 1)
+
+    def test_repeated_and_comma_separated_ids(self):
+        out = self.temp_dir()
+        code = self.run_script(out, "--song-id", "ok-1,ok-2", "--song-id", "ok-3")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.streamed(), ["ok-1", "ok-2", "ok-3"])
+        self.assertEqual(len(list(out.rglob("*.opus"))), 3)
+
+    def test_duplicate_ids_are_downloaded_once(self):
+        out = self.temp_dir()
+        self.assertEqual(self.run_script(out, "--song-id", "ok-1", "--song-id", "ok-1"), 0)
+        self.assertEqual(self.streamed(), ["ok-1"])
+        self.assertEqual(len(list(out.rglob("*.opus"))), 1)
+
+    def test_blank_entries_in_a_comma_list_are_ignored(self):
+        out = self.temp_dir()
+        self.assertEqual(self.run_script(out, "--song-id", " , ok-1, "), 0)
+        self.assertEqual(self.streamed(), ["ok-1"])
+
+    def test_unknown_id_is_reported_and_the_rest_still_download(self):
+        out = self.temp_dir()
+        code = self.run_script(out, "--song-id", "ok-1", "--song-id", "nope")
+
+        self.assertEqual(code, 1, "a missing requested track has to show in the exit code")
+        self.assertTrue((out / "Artist One - First Album" / "01 - One One.opus").is_file())
+        self.assertEqual(len(list(out.rglob("*.opus"))), 1)
+
+    def test_every_id_unknown_exits_2(self):
+        out = self.temp_dir()
+        self.assertEqual(self.run_script(out, "--song-id", "nope", "--song-id", "also-nope"), 2)
+        self.assertEqual(list(out.rglob("*")), [], "nothing may be written when nothing was resolved")
+
+    def test_getsong_failure_with_nothing_resolved_exits_2(self):
+        self.stub(**{"song:ok-1": "server-error"})
+        out = self.temp_dir()
+        self.assertEqual(self.run_script(out, "--song-id", "ok-1"), 2)
+        self.assertEqual(list(out.rglob("*.opus")), [])
+
+    def test_id_that_is_not_a_track_is_not_downloadable(self):
+        # A directory entry the server knows about, but which is not a stream.
+        self.server.state["albums"].append(
+            album_fixture("al-9", "Booklet", "Various", [{"id": "note-1", "isDir": True, "title": "Notes"}])
+        )
+        self.addCleanup(self.server.state["albums"].pop)
+
+        out = self.temp_dir()
+        self.assertEqual(self.run_script(out, "--song-id", "note-1"), 2)
+        self.assertEqual(list(out.rglob("*.opus")), [])
+
+    def test_limit_cannot_drop_a_requested_id(self):
+        out = self.temp_dir()
+        self.assertEqual(self.run_script(out, "--song-id", "ok-3", "--limit", "1"), 0)
+        self.assertEqual(self.streamed(), ["ok-3"])
+
+    def test_manifest_records_the_requested_tracks_only(self):
+        out = self.temp_dir()
+        self.assertEqual(self.run_script(out, "--song-id", "ok-3"), 0)
+        records = [json.loads(line) for line in (out / "manifest.jsonl").read_text().strip().splitlines()]
+        self.assertEqual([record["id"] for record in records], ["ok-3"])
+        self.assertEqual(records[0]["album"], "Second Album")
+
+
+class TestSearchSelection(SelectionTestCase):
+    def test_matches_are_downloaded(self):
+        out = self.temp_dir()
+        self.assertEqual(self.run_script(out, "--search", "second"), 0)
+
+        self.assertTrue((out / "Artist Two - Second Album" / "01 - Two One.opus").is_file())
+        self.assertEqual(len(list(out.rglob("*.opus"))), 1)
+        self.assertEqual(self.streamed(), ["ok-3"])
+
+    def test_no_library_scan_is_needed(self):
+        out = self.temp_dir()
+        self.assertEqual(self.run_script(out, "--search", "one"), 0)
+        for endpoint in ("getAlbumList2", "getAlbum", "getStarred2"):
+            self.assertNotIn(endpoint, self.endpoints(), f"{endpoint} must not be called")
+        self.assertIn("search3", self.endpoints())
+
+    def test_matching_artists_and_albums_are_not_streams(self):
+        # search3 also returns artist and album hits; only songs can be streamed.
+        out = self.temp_dir()
+        self.assertEqual(self.run_script(out, "--search", "fixture"), 0)
+        streamed = set(self.streamed())
+        self.assertTrue(streamed, "the fixture query should match the fixture songs")
+        self.assertNotIn("ar-1", streamed, "an artist hit is not a track")
+        self.assertNotIn("al-1", streamed, "an album hit is not a track")
+        self.assertTrue(streamed <= {"star-1", "ok-1", "ok-2", "ok-3"}, streamed)
+
+    def test_results_are_paged(self):
+        original = navi.SEARCH_PAGE_SIZE
+        navi.SEARCH_PAGE_SIZE = 1
+        self.addCleanup(setattr, navi, "SEARCH_PAGE_SIZE", original)
+
+        out = self.temp_dir()
+        # "one" matches all three titles, so paging has to walk the whole set.
+        self.assertEqual(self.run_script(out, "--search", "one"), 0)
+        pages = [
+            (params["songCount"], params["songOffset"])
+            for endpoint, params in self.server.state["requests"]
+            if endpoint == "search3"
+        ]
+        self.assertEqual(pages, [("1", "0"), ("1", "1"), ("1", "2"), ("1", "3")])
+        self.assertEqual(self.streamed(), ["ok-1", "ok-2", "ok-3"])
+
+    def test_no_match_is_a_clean_no_op(self):
+        out = self.temp_dir()
+        self.assertEqual(self.run_script(out, "--search", "nothingmatchesthis"), 0)
+        self.assertEqual(list(out.rglob("*")), [])
+        self.assertFalse((out / "manifest.jsonl").exists())
+
+    def test_search_is_case_insensitive(self):
+        out = self.temp_dir()
+        self.assertEqual(self.run_script(out, "--search", "SECOND"), 0)
+        self.assertEqual(self.streamed(), ["ok-3"])
+
+
+class TestLocalFilterSelection(SelectionTestCase):
+    def test_artist_filter(self):
+        out = self.temp_dir()
+        self.assertEqual(self.run_script(out, "--artist", "artist two"), 0)
+        self.assertTrue((out / "Artist Two - Second Album" / "01 - Two One.opus").is_file())
+        self.assertEqual(self.streamed(), ["ok-3"])
+        self.assertFalse((out / "Artist One - First Album").exists())
+
+    def test_album_filter_is_a_substring_match(self):
+        out = self.temp_dir()
+        self.assertEqual(self.run_script(out, "--album", "cond al"), 0)
+        self.assertEqual(self.streamed(), ["ok-3"])
+
+    def test_filters_still_walk_the_library(self):
+        out = self.temp_dir()
+        self.assertEqual(self.run_script(out, "--artist", "Artist One"), 0)
+        self.assertIn("getAlbumList2", self.endpoints())
+        self.assertEqual(sorted(self.streamed()), ["ok-1", "ok-2"])
+
+    def test_no_match_is_a_clean_no_op(self):
+        out = self.temp_dir()
+        self.assertEqual(self.run_script(out, "--artist", "nobody at all"), 0)
+        self.assertEqual(list(out.rglob("*")), [])
+
+    def test_limit_applies_to_the_matches(self):
+        out = self.temp_dir()
+        # The scan cannot stop early here, because a filter that never saw the
+        # second album would answer a different question; --limit then takes the
+        # first of the matches.
+        self.assertEqual(self.run_script(out, "--artist", "artist one", "--limit", "1"), 0)
+        self.assertEqual(len(list(out.rglob("*.opus"))), 1)
+        self.assertEqual([params["id"] for endpoint, params in self.server.state["requests"]
+                          if endpoint == "getAlbum"], ["al-1", "al-2"])
+
+
+class TestInteractiveSelection(EndToEndTestCase):
+    library = (("star-1", "Starred Only", 1),)
+    albums = multi_album_fixture()
+
+    def interactive(self, *answers):
+        """Pretend stdin is a terminal, script the prompt, and capture the table.
+
+        An answer may be an exception instance, which is raised instead -- that
+        is how Ctrl-D at the prompt is simulated.
+        """
+        tty = mock.patch.object(navi, "_stdin_is_tty", return_value=True)
+        tty.start()
+        self.addCleanup(tty.stop)
+
+        remaining = list(answers)
+
+        def answer(_prompt=""):
+            if not remaining:
+                # A question the test did not expect must fail loudly, not hang.
+                raise EOFError("no more scripted answers")
+            scripted = remaining.pop(0)
+            if isinstance(scripted, BaseException):
+                raise scripted
+            return scripted
+
+        patcher = mock.patch("builtins.input", side_effect=answer)
+        prompt = patcher.start()
+        self.addCleanup(patcher.stop)
+
+        # The candidate table is the prompt's own output, so it is captured and
+        # asserted on rather than sprayed over the test report.
+        self.prompt_output = io.StringIO()
+        capture = contextlib.redirect_stdout(self.prompt_output)
+        capture.__enter__()
+        self.addCleanup(capture.__exit__, None, None, None)
+        return prompt
+
+    def streamed(self):
+        return [song_id for song_id, _fmt, _bitrate in self.server.state["stream_params"]]
+
+    def test_a_terminal_is_asked_and_only_chosen_tracks_download(self):
+        prompt = self.interactive("2,3")
+        out = self.temp_dir()
+        self.assertEqual(self.run_script(out), 0)
+
+        self.assertTrue(prompt.called, "a terminal run must ask before downloading")
+        self.assertEqual(self.streamed(), ["ok-2", "ok-3"])
+        self.assertFalse((out / "Artist One - First Album" / "01 - One One.opus").exists())
+        self.assertEqual(len(list(out.rglob("*.opus"))), 2)
+
+    def test_the_candidate_list_is_printed(self):
+        self.interactive("1")
+        out = self.temp_dir()
+        self.assertEqual(self.run_script(out), 0)
+        printed = self.prompt_output.getvalue()
+        self.assertIn("One One", printed)
+        self.assertIn("Artist One", printed)
+        self.assertIn("ok-1", printed, "the id is what makes --song-id usable afterwards")
+        self.assertIn("3 candidate(s)", printed)
+
+    def test_all_answers_take_every_candidate(self):
+        self.interactive("all")
+        out = self.temp_dir()
+        self.assertEqual(self.run_script(out), 0)
+        self.assertEqual(len(list(out.rglob("*.opus"))), 3)
+
+    def test_quitting_downloads_nothing(self):
+        self.interactive("q")
+        out = self.temp_dir()
+        self.assertEqual(self.run_script(out), 0)
+        self.assertEqual(list(out.rglob("*")), [])
+
+    def test_an_unanswered_prompt_is_not_a_crash(self):
+        self.interactive(EOFError())
+        out = self.temp_dir()
+        self.assertEqual(self.run_script(out), 0)
+        self.assertEqual(list(out.rglob("*")), [])
+
+    def test_a_bad_answer_is_rejected_and_asked_again(self):
+        prompt = self.interactive("9", "nope", "1")
+        out = self.temp_dir()
+        self.assertEqual(self.run_script(out), 0)
+        self.assertEqual(prompt.call_count, 3)
+        self.assertEqual(self.streamed(), ["ok-1"])
+        self.assertIn("Try again", self.prompt_output.getvalue())
+
+    def test_all_skips_the_prompt_in_a_terminal(self):
+        prompt = self.interactive()
+        out = self.temp_dir()
+        self.assertEqual(self.run_script(out, "--all"), 0)
+        self.assertEqual(prompt.call_count, 0, "--all must not ask anything")
+        self.assertEqual(len(list(out.rglob("*.opus"))), 3)
+
+    def test_pick_is_the_same_prompt_explicitly(self):
+        self.interactive("1")
+        out = self.temp_dir()
+        self.assertEqual(self.run_script(out, "--pick"), 0)
+        self.assertEqual(self.streamed(), ["ok-1"])
+
+    def test_pick_without_a_terminal_fails_loudly(self):
+        out = self.temp_dir()
+        self.assertEqual(self.run_script(out, "--pick"), 2)
+        self.assertEqual(
+            list(out.rglob("*")), [], "--pick must not quietly download the whole library instead"
+        )
+
+    def test_pick_lists_the_favorites_too(self):
+        self.interactive("1")
+        out = self.temp_dir()
+        self.assertEqual(self.run_script(out, "--favorites-only"), 0)
+        self.assertTrue((out / "Fixture Artist - Fixture Album" / "01 - Starred Only.opus").is_file())
+        self.assertEqual(self.streamed(), ["star-1"])
+
+    def test_the_prompt_ignores_limit_so_the_list_is_complete(self):
+        self.interactive("all")
+        out = self.temp_dir()
+        # --limit still applies, but the list offered must be the whole library.
+        self.assertEqual(self.run_script(out, "--limit", "2"), 0)
+        self.assertEqual(len(list(out.rglob("*.opus"))), 2)
+
+    def test_search_then_pick_is_one_command(self):
+        self.interactive("1")
+        out = self.temp_dir()
+        self.assertEqual(self.run_script(out, "--search", "one", "--pick"), 0)
+
+        # Only the three "one" hits were ever offered, and one was chosen.
+        self.assertIn("One One", self.prompt_output.getvalue())
+        self.assertNotIn("Starred Only", self.prompt_output.getvalue())
+        self.assertEqual(self.streamed(), ["ok-1"])
+
+    def test_filter_then_pick_offers_only_the_matches(self):
+        self.interactive("1")
+        out = self.temp_dir()
+        self.assertEqual(self.run_script(out, "--artist", "artist two", "--pick"), 0)
+        self.assertIn("Two One", self.prompt_output.getvalue())
+        self.assertNotIn("One One", self.prompt_output.getvalue())
+        self.assertEqual(self.streamed(), ["ok-3"])
+
+    def test_a_terminal_asks_even_for_a_scope(self):
+        self.interactive("all")
+        out = self.temp_dir()
+        self.assertEqual(self.run_script(out, "--search", "second"), 0)
+        self.assertIn("1 candidate(s)", self.prompt_output.getvalue())
+        self.assertEqual(self.streamed(), ["ok-3"])
+
+    def test_an_empty_scope_is_not_asked_about(self):
+        # Nothing to choose from: the reason matters more than a prompt.
+        self.interactive()
+        out = self.temp_dir()
+        self.assertEqual(self.run_script(out, "--search", "nothingmatchesthis"), 0)
+        self.assertEqual(list(out.rglob("*")), [])
+
+    def test_song_id_is_never_asked_about(self):
+        prompt = self.interactive()
+        out = self.temp_dir()
+        self.assertEqual(self.run_script(out, "--song-id", "ok-1"), 0)
+        self.assertEqual(prompt.call_count, 0, "an explicit list of ids is the whole answer")
+        self.assertEqual(self.streamed(), ["ok-1"])
+
+
+class TestSelectionParsing(unittest.TestCase):
+    def test_single_number(self):
+        self.assertEqual(navi.parse_selection("2", 5), [1])
+
+    def test_lists_and_ranges(self):
+        self.assertEqual(navi.parse_selection("2,5", 8), [1, 4])
+        self.assertEqual(navi.parse_selection("2 5", 8), [1, 4])
+        self.assertEqual(navi.parse_selection("2-4", 8), [1, 2, 3])
+        self.assertEqual(navi.parse_selection(" 2 , 4 - 5 , 8 ", 8), [1, 3, 4, 7])
+
+    def test_reversed_range_is_accepted(self):
+        self.assertEqual(navi.parse_selection("5-2", 8), [1, 2, 3, 4])
+
+    def test_sentinel_answers(self):
+        self.assertEqual(navi.parse_selection("all", 3), [0, 1, 2])
+        self.assertEqual(navi.parse_selection("ALL", 3), [0, 1, 2])
+        self.assertEqual(navi.parse_selection("none", 3), [])
+        self.assertEqual(navi.parse_selection("q", 3), [])
+        self.assertEqual(navi.parse_selection("quit", 3), [])
+
+    def test_repeats_are_collapsed(self):
+        self.assertEqual(navi.parse_selection("2,2,2-3", 5), [1, 2])
+
+    def test_zero_does_not_wrap_to_the_last_track(self):
+        with self.assertRaises(navi.SelectionError):
+            navi.parse_selection("0", 5)
+        with self.assertRaises(navi.SelectionError):
+            navi.parse_selection("0-2", 5)
+
+    def test_out_of_range_is_rejected(self):
+        for answer in ("6", "2-6", "0"):
+            with self.assertRaises(navi.SelectionError):
+                navi.parse_selection(answer, 5)
+
+    def test_nonsense_is_rejected(self):
+        for answer in ("", "   ", "x", "1-2-3", "1-", "-1", "all please", "1,,x"):
+            with self.assertRaises(navi.SelectionError, msg=answer):
+                navi.parse_selection(answer, 5)
+
+    def test_error_messages_are_shown_as_is(self):
+        with self.assertRaises(navi.SelectionError) as caught:
+            navi.parse_selection("99", 5)
+        self.assertIn("5 candidate(s)", str(caught.exception))
+
+
+class TestSelectionTable(unittest.TestCase):
+    def songs(self, count, start=1):
+        return [song_entry(f"id-{index}", f"Title {index}", index) for index in range(start, start + count)]
+
+    def render(self, songs, page_size=None):
+        buffer = io.StringIO()
+        # "q" is a real answer, unlike "": an empty answer is rejected and asked
+        # again, which would spin here forever.
+        navi.prompt_for_tracks(songs, reader=lambda: "q", writer=buffer, page_size=page_size or navi.PICKER_PAGE_SIZE)
+        return buffer.getvalue()
+
+    def test_every_candidate_is_listed_once(self):
+        printed = self.render(self.songs(5))
+        for index in range(1, 6):
+            self.assertIn(f"Title {index}", printed)
+        self.assertIn("id-1", printed)
+        self.assertEqual(printed.count("Title 1"), 1)
+        self.assertIn("5 candidate(s)", printed)
+
+    def test_long_lists_are_paged_not_truncated(self):
+        printed = self.render(self.songs(450), page_size=200)
+        # Three screens: 200 + 200 + 50, with the reader answering each pause.
+        self.assertEqual(printed.count("press Enter for the next page"), 2)
+        self.assertIn("-- 250 more candidate(s)", printed)
+        self.assertIn("-- 50 more candidate(s)", printed)
+        self.assertIn("Title 450", printed)
+
+    def test_track_and_length_columns(self):
+        printed = self.render([song_entry("id-1", "Song", 5)])
+        self.assertIn("05", printed)
+        self.assertIn("4:05", printed)
+
+    def test_multidisc_and_unknown_positions(self):
+        song = song_entry("id-1", "Song", 5)
+        song["discNumber"] = 2
+        buffer = io.StringIO()
+        navi.prompt_for_tracks([song], reader=lambda: "q", writer=buffer)
+        self.assertIn("02-05", buffer.getvalue())
+
+        bare = {"id": "id-2", "title": "Bare"}
+        buffer = io.StringIO()
+        navi.prompt_for_tracks([bare], reader=lambda: "q", writer=buffer)
+        printed = buffer.getvalue()
+        self.assertIn("--", printed)
+        self.assertIn("--:--", printed, "a track with no duration must not claim to be zero long")
+
+    def test_nothing_to_choose_from_is_an_error(self):
+        with self.assertRaises(navi.SelectionError):
+            navi.prompt_for_tracks([], reader=lambda: "q", writer=io.StringIO())
+
+    def test_wide_characters_do_not_break_the_columns(self):
+        # CJK is one character but two terminal columns, so len() would misalign
+        # any table mixing it with ASCII.
+        songs = [
+            song_entry("id-1", "白夜", 1, "白夜", "Reol"),
+            song_entry("id-2", "Blue", 1, "Blue", "Reol"),
+            song_entry("id-3", "Combine", 2, "Mixed", "Reol"),
+        ]
+        printed = self.render(songs)
+        self.assertIn("白夜", printed)
+        rows = [
+            line
+            for line in printed.splitlines()
+            if line.strip() and "Which to download?" not in line
+        ]
+        self.assertEqual(len(rows), 3, printed)
+        widths = {navi._display_width(row) for row in rows}
+        self.assertEqual(len(widths), 1, f"columns are not aligned:\n{printed}")
+
+    def test_display_width_and_fit(self):
+        self.assertEqual(navi._display_width("abc"), 3)
+        self.assertEqual(navi._display_width("白夜"), 4)
+        self.assertEqual(navi._display_width("é"), 1)
+        self.assertEqual(navi._fit("ab", 5), "ab   ")
+        self.assertEqual(navi._display_width(navi._fit("白夜白夜白夜", 6)), 6)
+        self.assertEqual(navi._display_width(navi._fit("abcdef", 4)), 4)
+
+
+class TestSelectionHelpers(unittest.TestCase):
+    def test_split_ids(self):
+        self.assertEqual(navi._split_ids(["a, b", "c", "a", "", " ,d"]), ["a", "b", "c", "d"])
+        self.assertEqual(navi._split_ids(None), [])
+        self.assertEqual(navi._split_ids([]), [])
+
+    def test_filter_songs(self):
+        songs = [
+            song_entry("a", "One", 1, "Blue", "Miles Davis"),
+            song_entry("b", "Two", 1, "Kind of Blue", "Miles Davis"),
+            song_entry("c", "Three", 1, "Radio", "Radiohead"),
+        ]
+        self.assertEqual([s["id"] for s in navi.filter_songs(songs, "miles")], ["a", "b"])
+        self.assertEqual([s["id"] for s in navi.filter_songs(songs, "MILES")], ["a", "b"])
+        self.assertEqual([s["id"] for s in navi.filter_songs(songs, album="blue")], ["a", "b"])
+        self.assertEqual([s["id"] for s in navi.filter_songs(songs, "miles", "kind")], ["b"])
+        self.assertEqual(navi.filter_songs(songs), songs)
+        self.assertEqual(navi.filter_songs(songs, "nobody"), [])
+
+    def test_filter_survives_missing_metadata(self):
+        # A track with no artist or album must not crash the filter, and must
+        # not match a filter that names either of them.
+        songs = [{"id": "a", "title": "Bare"}, {"id": "b", "title": "Named", "artist": None}]
+        self.assertEqual(navi.filter_songs(songs, "anything"), [])
+        self.assertEqual(navi.filter_songs(songs, album="blue"), [])
+        self.assertEqual(navi.filter_songs([songs[1]], ""), [songs[1]])
+
+    def test_format_duration(self):
+        self.assertEqual(navi.format_duration(0), "--:--")
+        self.assertEqual(navi.format_duration(None), "--:--")
+        self.assertEqual(navi.format_duration("245"), "4:05")
+        self.assertEqual(navi.format_duration(59), "0:59")
+        self.assertEqual(navi.format_duration(3725), "1:02:05")
+        self.assertEqual(navi.format_duration("junk"), "--:--")
+
+    def test_nested_album_and_artist_are_flattened(self):
+        song = {"id": "a", "title": "T", "album": {"id": "al-1", "name": "Blue"}, "artist": {"name": "Miles"}}
+        flat = navi._normalise_song(song)
+        self.assertEqual(flat["album"], "Blue")
+        self.assertEqual(flat["artist"], "Miles")
+        # The original must not be modified.
+        self.assertIsInstance(song["album"], dict)
+
+    def test_nested_metadata_still_fills_in_paths(self):
+        song = navi._normalise_song(
+            {
+                "id": "a",
+                "title": "So What",
+                "track": 1,
+                "suffix": "flac",
+                "album": {"name": "Kind of Blue"},
+                "artist": {"name": "Miles Davis"},
+            }
+        )
+        self.assertEqual(navi.build_album_dir_name(song), "Miles Davis - Kind of Blue")
+        self.assertEqual(navi.build_track_filename(song, ".opus"), "01 - So What.opus")
+
+    def test_stdout_writer_is_used_by_default(self):
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            navi.prompt_for_tracks([song_entry("a", "Song", 1)], reader=lambda: "1")
+        self.assertIn("Song", buffer.getvalue())
+
+
 class TestRetryBehaviour(EndToEndTestCase):
     library = (("ratelimit-1", "Rate Limited", 1),)
     behaviours = {"ratelimit-1": "ratelimit"}
@@ -1636,6 +2233,77 @@ class TestArgumentValidation(unittest.TestCase):
             ["--url", "http://x", "--user", "a", "--password", "b", "--favorites-only"]
         )
         self.assertTrue(args.favorites_only)
+
+    def test_selection_defaults(self):
+        args = navi.build_parser().parse_args(["--url", "http://x", "--user", "a", "--password", "b"])
+        self.assertIsNone(args.song_id)
+        self.assertIsNone(args.search)
+        self.assertIsNone(args.artist)
+        self.assertIsNone(args.album)
+        self.assertFalse(args.pick)
+        self.assertFalse(args.all, "a terminal run asks rather than assuming")
+
+    def test_song_id_is_repeatable(self):
+        args = navi.build_parser().parse_args(
+            ["--url", "http://x", "--user", "a", "--password", "b", "--song-id", "a", "--song-id", "b,c"]
+        )
+        self.assertEqual(args.song_id, ["a", "b,c"])
+        self.assertEqual(navi._split_ids(args.song_id), ["a", "b", "c"])
+
+    def test_only_one_scope_at_a_time(self):
+        scopes = (
+            ["--favorites-only"],
+            ["--song-id", "a"],
+            ["--search", "q"],
+            ["--artist", "x"],
+            ["--album", "y"],
+        )
+        for first in scopes:
+            for second in scopes:
+                if first is second:
+                    continue
+                args = navi.build_parser().parse_args(
+                    ["--url", "http://x", "--user", "a", "--password", "b"] + first + second
+                )
+                problems = navi.validate_args(args)
+                self.assertTrue(
+                    any("choose one scope" in problem for problem in problems),
+                    f"{first} with {second} should be rejected, got {problems}",
+                )
+
+    def test_asking_composes_with_a_scope(self):
+        # --pick and --all answer "should I ask?", not "what do I want?", so
+        # they are allowed with a scope -- that is what makes search-then-pick a
+        # single command.
+        for modifier in (["--pick"], ["--all"], []):
+            for scope in (["--search", "q"], ["--artist", "x"], ["--favorites-only"], []):
+                args = navi.build_parser().parse_args(
+                    ["--url", "http://x", "--user", "a", "--password", "b"] + modifier + scope
+                )
+                self.assertEqual(navi.validate_args(args), [], f"{modifier} with {scope} should be valid")
+
+    def test_every_single_scope_is_accepted(self):
+        for scope in (["--favorites-only"], ["--song-id", "a"], ["--search", "q"],
+                      ["--artist", "x"], ["--album", "y"], ["--all"], []):
+            args = navi.build_parser().parse_args(
+                ["--url", "http://x", "--user", "a", "--password", "b"] + scope
+            )
+            self.assertEqual(navi.validate_args(args), [], f"{scope} should be valid on its own")
+
+    def test_empty_scope_values_are_rejected(self):
+        for flag in ("--search", "--artist", "--album"):
+            code = navi.main(
+                ["--url", "http://x", "--user", "a", "--password", "b",
+                 flag, "   ", "--log-level", "CRITICAL", "--dry-run"]
+            )
+            self.assertEqual(code, 2, f"{flag} with a blank value should be rejected")
+
+    def test_pick_cannot_be_combined_with_all(self):
+        code = navi.main(
+            ["--url", "http://x", "--user", "a", "--password", "b",
+             "--pick", "--all", "--log-level", "CRITICAL", "--dry-run"]
+        )
+        self.assertEqual(code, 2)
 
 
 if __name__ == "__main__":

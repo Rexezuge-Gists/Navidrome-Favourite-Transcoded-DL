@@ -1,8 +1,20 @@
 #!/usr/bin/env python3
-"""Download a Navidrome library as transcoded Opus files.
+"""Download chosen tracks from Navidrome as transcoded Opus files.
 
-Every track in the library the account can see is downloaded by default; pass
-``--favorites-only`` for just the starred ones.
+Run from a terminal, the script shows what it found and asks which tracks to
+download, so the common case is "grab these three songs". Pass ``--all`` (or
+pipe the output, or run it from cron, where there is no terminal) to take
+everything without being asked. Tracks can also be chosen up front instead:
+
+  * ``--song-id``     - exact Subsonic song ids (``getSong``)
+  * ``--search``      - a server-side search over title/artist/album (``search3``)
+  * ``--artist`` / ``--album`` - substring filters over the enumerated library
+  * ``--favorites-only`` - the account's starred tracks
+
+Only one of those may be given per run, so what a command means is never
+ambiguous. ``--pick`` and ``--all`` are not scopes: they answer "should I ask?",
+and either may be combined with a scope -- so ``--search reol --pick`` searches
+and then lets you choose from the hits.
 
 Navidrome only exposes transcoded audio through the Subsonic API (``/rest``), so
 this script speaks that protocol end to end:
@@ -11,13 +23,16 @@ this script speaks that protocol end to end:
   * ``getAlbumList2`` - page through every album (``alphabeticalByName``)
   * ``getAlbum``      - the tracks of one album
   * ``getStarred2``   - the account's favorite tracks (``--favorites-only``)
+  * ``getSong``       - the metadata of one named track (``--song-id``)
+  * ``search3``       - search by title/artist/album (``--search``)
   * ``getCoverArt``   - one album cover per album, reused across its tracks
   * ``stream``        - the audio, transcoded server side to Opus at a bitrate
 
 Enumerating the library costs one ``getAlbum`` request per album, which is
 cheap next to streaming a full transcode of every track, and it is what makes
 the list complete: ``getAlbum`` returns an album's tracks without a page limit,
-so nothing can fall through a paging gap.
+so nothing can fall through a paging gap. ``--song-id`` and ``--search`` skip
+that walk entirely, because the server already knows which tracks match.
 
 Authentication uses the Subsonic token scheme (``t=md5(password+salt)``) so the
 plaintext password never appears in a URL, and therefore never lands in a
@@ -60,7 +75,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Iterator, Optional, Sequence
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 LOG = logging.getLogger("navifavsync")
 
@@ -85,6 +100,19 @@ ALBUM_PAGE_SIZE = 500
 MAX_ALBUM_PAGES = 1000
 # Scanning a large library is slow, so say something while it happens.
 ALBUM_PROGRESS_EVERY = 25
+
+# search3 is paged too, and 100 per page is within every server's comfort zone.
+SEARCH_PAGE_SIZE = 100
+# 10 pages is 1000 matches; a guard against a server that never returns a short
+# page, and a sane ceiling for "download everything this query matched".
+MAX_SEARCH_PAGES = 10
+
+# Rows of the candidate list shown between "press enter for more" prompts.
+PICKER_PAGE_SIZE = 200
+# Sentinel answers accepted at the selection prompt.
+PICKER_ALL = "all"
+PICKER_NONE = "none"
+PICKER_QUIT = "q"
 
 # Transient conditions worth another attempt.
 RETRYABLE_HTTP_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
@@ -154,6 +182,11 @@ class NotTranscodedError(NavifavError):
 
 class OggError(NavifavError):
     """The Ogg/Opus container could not be parsed or rewritten."""
+
+
+class SelectionError(NavifavError):
+    """A selection could not be made: conflicting flags, song ids the server does
+    not know, or a ``--pick`` with no terminal to ask the question on."""
 
 
 # ---------------------------------------------------------------------------
@@ -806,6 +839,21 @@ def _playable_songs(value: Any) -> list:
     ]
 
 
+def _normalise_song(song: dict) -> dict:
+    """Flatten ``album``/``artist`` to plain names, as ``search3`` may nest them.
+
+    Subsonic's spec lets search results carry the album and artist as objects;
+    other fields (and every other endpoint) use a bare string. Path building and
+    filtering need the string form, so collapse both shapes here.
+    """
+    flattened = dict(song)
+    for key in ("album", "artist"):
+        value = flattened.get(key)
+        if isinstance(value, dict):
+            flattened[key] = str(value.get("name") or value.get("title") or value.get("album") or "")
+    return flattened
+
+
 def _md5_hex(data: bytes) -> str:
     try:
         return hashlib.md5(data, usedforsecurity=False).hexdigest()
@@ -990,6 +1038,59 @@ class NavidromeClient:
         # getStarred2 also returns starred artists and albums; keep only real tracks.
         return _playable_songs(starred.get("song"))
 
+    def fetch_song(self, song_id: str) -> Optional[dict]:
+        """Return the metadata of one track, or ``None`` if it is not playable.
+
+        One request per id, which is what makes ``--song-id`` usable on a huge
+        library: nothing else is enumerated.
+        """
+        response = self.call("getSong", {"id": song_id})
+        # getSong answers with a single song object rather than a list.
+        entries = _as_entries(response.get("song"))
+        if not entries:
+            return None
+        songs = _playable_songs([_normalise_song(entries[0])])
+        return songs[0] if songs else None
+
+    def search_songs(self, query: str) -> list:
+        """Return the tracks matching *query*, one ``search3`` page at a time."""
+        offset = 0
+        found: list = []
+        seen: set = set()
+        for _page in range(MAX_SEARCH_PAGES):
+            response = self.call(
+                "search3",
+                {
+                    "query": query,
+                    "songCount": str(SEARCH_PAGE_SIZE),
+                    "songOffset": str(offset),
+                    "artistCount": "0",
+                    "albumCount": "0",
+                },
+            )
+            results = response.get("searchResult3") or {}
+            # search3 also returns matching artists and albums; only songs stream.
+            songs = _playable_songs([_normalise_song(song) for song in _as_entries(results.get("song"))])
+            if not songs:
+                return found
+            for song in songs:
+                song_id = str(song["id"])
+                if song_id in seen:
+                    continue
+                seen.add(song_id)
+                found.append(song)
+            if len(songs) < SEARCH_PAGE_SIZE:
+                return found
+            offset += SEARCH_PAGE_SIZE
+        LOG.warning(
+            "Stopped after %d search pages (%d matches) for %r; narrow the query or "
+            "list the song ids instead",
+            MAX_SEARCH_PAGES,
+            len(found),
+            query,
+        )
+        return found
+
     def iter_albums(self) -> Iterator[dict]:
         """Yield every album the account can see, one ``getAlbumList2`` page at a time."""
         offset = 0
@@ -1090,6 +1191,404 @@ def _short_body(body: bytes, limit: int = 200) -> str:
         return ""
     text = body[:limit].decode("utf-8", "replace").strip()
     return f"({text})" if text else ""
+
+
+# ---------------------------------------------------------------------------
+# Track selection
+# ---------------------------------------------------------------------------
+#
+# A run has one scope -- what it wants -- and one answer to "should I ask?".
+# Only the scope is exclusive:
+#
+#   --song-id ......... one getSong per id, nothing else is enumerated
+#   --search .......... paged search3, the server decides what matches
+#   --artist/--album .. the normal library walk, then a substring filter
+#   --favorites-only .. getStarred2
+#   (none of those) ... the whole library
+#
+# Asking is the default whenever there is a terminal to ask on. --all turns that
+# off, and --pick insists on it, so an unattended --pick fails loudly rather than
+# quietly downloading everything. Both compose with a scope, which is what makes
+# "--search something, then pick from the hits" a single command.
+#
+# ``Selection`` carries the answer plus everything the rest of the run needs to
+# describe it: the noun for the "Found N ..." line, why an empty list is empty,
+# and the count of explicit song ids the server could not resolve.
+
+
+@dataclasses.dataclass
+class Selection:
+    songs: list
+    scope: str
+    errors: int = 0
+    # Why the list is empty, when it is; a run with nothing to do is a success,
+    # but only if the log says so rather than falling silent.
+    note: str = ""
+
+
+def _stdin_is_tty() -> bool:
+    """Whether there is a human on the other end of stdin to answer a prompt."""
+    try:
+        return bool(sys.stdin) and sys.stdin.isatty()
+    except (AttributeError, ValueError):  # pragma: no cover - closed stdin
+        return False
+
+
+def _split_ids(values: Optional[Sequence[str]]) -> list:
+    """Flatten repeated and comma-joined flag values into one ordered id list."""
+    ids: list = []
+    for value in values or ():
+        for part in str(value).split(","):
+            part = part.strip()
+            if part and part not in ids:
+                ids.append(part)
+    return ids
+
+
+def filter_songs(songs: Sequence, artist: str = "", album: str = "") -> list:
+    """Keep the tracks whose artist/album contain *artist*/*album*.
+
+    Case-insensitive and substring based, so ``--artist radiohead`` matches
+    "Radiohead" and ``--album "blue in"`` finds a multi-word album.
+    """
+    wanted_artist = artist.casefold().strip()
+    wanted_album = album.casefold().strip()
+    if not wanted_artist and not wanted_album:
+        return list(songs)
+
+    def matches(song: dict) -> bool:
+        if wanted_artist and wanted_artist not in str(song.get("artist") or "").casefold():
+            return False
+        if wanted_album and wanted_album not in str(song.get("album") or "").casefold():
+            return False
+        return True
+
+    return [song for song in songs if matches(song)]
+
+
+def format_duration(seconds: Any) -> str:
+    """Format a Subsonic ``duration`` as ``M:SS`` (``H:MM:SS`` when long)."""
+    total = _as_int(seconds)
+    if total <= 0:
+        return "--:--"
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
+def _track_label(song: dict) -> str:
+    """The track's position within its album, e.g. ``03`` or ``02-05``."""
+    track = _as_int(song.get("track"))
+    disc = _as_int(song.get("discNumber"))
+    if disc > 1:
+        return f"{disc:02d}-{track:02d}"
+    if track > 0:
+        return f"{track:02d}"
+    return "--"
+
+
+def _display_width(text: str) -> int:
+    """How many terminal columns *text* occupies.
+
+    CJK and emoji are two cells wide but one character, and a combining mark
+    takes none, so ``len()`` would misalign every table containing them.
+    """
+    width = 0
+    for char in text:
+        if unicodedata.combining(char):
+            continue
+        width += 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+    return width
+
+
+def _fit(text: str, width: int) -> str:
+    """Pad, or truncate with no ellipsis, to exactly *width* columns."""
+    text = str(text)
+    current = _display_width(text)
+    if current == width:
+        return text
+    if current < width:
+        return text + " " * (width - current)
+
+    kept = ""
+    used = 0
+    for char in text:
+        size = _display_width(char)
+        if used + size > width:
+            break
+        kept += char
+        used += size
+    return kept + " " * (width - used)
+
+
+def _parse_token(token: str, count: int) -> list:
+    """Expand one answer token into 0-based indexes: ``5`` or ``2-7``."""
+    if token.isdigit():
+        index = int(token)
+        if not 1 <= index <= count:
+            raise SelectionError(f"{index} is out of range; there are {count} candidate(s)")
+        return [index - 1]
+
+    parts = token.split("-")
+    if len(parts) != 2 or not all(part.strip().isdigit() for part in parts):
+        raise SelectionError(f"{token!r} is not a track number or a range like 2-7")
+    low, high = (int(part) for part in parts)
+    if low > high:
+        low, high = high, low
+    # Track numbers start at 1, so 0-2 would otherwise wrap round to the last track.
+    if low < 1:
+        raise SelectionError(f"{token!r} is out of range; track numbers start at 1")
+    if high > count:
+        raise SelectionError(f"{high} is out of range; there are {count} candidate(s)")
+    return list(range(low - 1, high))
+
+
+def parse_selection(text: str, count: int) -> list:
+    """Turn an answer at the prompt into 0-based indexes into *count* items.
+
+    Accepts ``2``, ``2,5``, ``2 5``, ``2-7``, ``2,5-7,9``, ``all``, ``none`` and
+    ``q``. Anything else raises ``SelectionError`` with a message the prompt can
+    show as-is, because a wrong guess here would download the wrong songs.
+    """
+    answer = (text or "").strip().casefold()
+    if answer in (PICKER_QUIT, "quit", "exit"):
+        return []
+    if answer in (PICKER_ALL, "*", "a"):
+        return list(range(count))
+    if answer in (PICKER_NONE, "n", "nothing"):
+        return []
+    if count <= 0:
+        raise SelectionError("there is nothing to choose from")
+
+    chosen: list = []
+    # "4 - 5" should mean the same as "4-5".
+    answer = re.sub(r"\s*-\s*", "-", answer)
+    for token in answer.replace(",", " ").split():
+        chosen.extend(_parse_token(token, count))
+    if not chosen:
+        raise SelectionError("no track numbers given")
+    # Listed order, and never the same track twice.
+    return sorted(set(chosen))
+
+
+def _write_candidate_table(
+    songs: Sequence, writer, *, page_size: int = PICKER_PAGE_SIZE, reader=None
+) -> None:
+    """Print the numbered candidate list, a screenful at a time.
+
+    Every candidate is always shown: a library too large for one screen is paged
+    rather than truncated, because a hidden track cannot be selected and its
+    absence would be invisible.
+    """
+    write = getattr(writer, "write", None)
+    total = len(songs)
+    total_width = len(str(total))
+
+    def title_of(song: dict) -> str:
+        return f"{song.get('artist') or '?'} - {song.get('title') or '?'}"
+
+    title_width = min(60, max((_display_width(title_of(song)) for song in songs), default=1))
+    album_width = min(40, max((_display_width(song.get("album") or "?") for song in songs), default=1))
+    id_width = max((len(str(song.get("id") or "")) for song in songs), default=1)
+
+    for start in range(0, total, page_size):
+        page = songs[start : start + page_size]
+        if start:
+            write("\n")
+        for offset, song in enumerate(page, start=start + 1):
+            write(
+                f"{offset:>{total_width}}  {_track_label(song):<5}  "
+                f"{_fit(title_of(song), title_width)}  "
+                f"{_fit(song.get('album') or '?', album_width)}  "
+                f"{format_duration(song.get('duration')):>7}  "
+                f"{_fit(song.get('id') or '', id_width)}\n"
+            )
+        remaining = total - (start + len(page))
+        if remaining:
+            write(f"-- {remaining} more candidate(s); press Enter for the next page --\n")
+            if reader is not None:
+                reader()
+
+
+def prompt_for_tracks(
+    songs: Sequence,
+    *,
+    reader=None,
+    writer=None,
+    page_size: int = PICKER_PAGE_SIZE,
+) -> list:
+    """Show *songs* and return the ones the user picked, in listed order.
+
+    An empty list means the user quit, typed ``none``, or closed stdin. Only a
+    candidate list with nothing in it raises, which is a bug rather than a choice.
+    """
+    if reader is None:
+        reader = input
+    if writer is None:
+        writer = sys.stdout
+    if not songs:
+        raise SelectionError("there is nothing to choose from")
+    write = getattr(writer, "write", None)
+    total = len(songs)
+
+    try:
+        _write_candidate_table(songs, writer, page_size=page_size, reader=reader)
+        while True:
+            hint = f", 1-{total}" if total > 1 else ""
+            write(f"\n{total} candidate(s). Which to download? [e.g. 2,5-7{hint}, all, none, q] ")
+            try:
+                chosen = parse_selection(reader(), total)
+            except SelectionError as exc:
+                write(f"{exc}. Try again.\n")
+                continue
+            return [songs[index] for index in chosen]
+    except EOFError:
+        # Ctrl-D: the same as typing q, not a crash.
+        write("\n")
+        return []
+
+
+def resolve_scope(client: NavidromeClient, args: argparse.Namespace) -> Selection:
+    """Work out which tracks this run should download.
+
+    Raises ``SelectionError`` for a scope that cannot produce a list at all
+    (no resolvable song ids, or a ``--pick`` with no terminal to ask on) and lets
+    ``SubsonicError`` from the API calls propagate.
+    """
+    prompting = _should_prompt(args)
+
+    if args.song_id:
+        # An explicit list of ids is already the whole answer.
+        return _select_by_song_id(client, _split_ids(args.song_id))
+
+    if args.search:
+        songs = client.search_songs(args.search)
+        return _finish(
+            songs,
+            f"track(s) matching {args.search!r}",
+            f"no track matched {args.search!r}",
+            prompting,
+        )
+
+    if args.artist or args.album:
+        # A filter needs every track to match against: stopping the scan early
+        # could miss the album the wanted artist is on, and would answer a
+        # different question than the one asked. So --limit cannot shorten this
+        # walk, and is applied to the matches instead.
+        wanted = " and ".join(
+            part
+            for part in (
+                f"artist ~ {args.artist!r}" if args.artist else "",
+                f"album ~ {args.album!r}" if args.album else "",
+            )
+            if part
+        )
+        candidates = _enumerate(client, args, whole_library=True, complete=True)
+        return _finish(
+            filter_songs(candidates, args.artist or "", args.album or ""),
+            f"track(s) with {wanted}",
+            f"no track in the library has {wanted}",
+            prompting,
+        )
+
+    if args.favorites_only:
+        return _finish(
+            client.fetch_favorites(),
+            "favorite track(s)",
+            f"no favorites found for user {args.user!r}",
+            prompting,
+        )
+
+    return _finish(
+        _enumerate(client, args, whole_library=True, complete=prompting),
+        "track(s) in the library",
+        f"no tracks found in the library visible to user {args.user!r}",
+        prompting,
+    )
+
+
+def _finish(candidates: list, scope: str, note: str, prompting: bool) -> Selection:
+    """Apply the prompt, if one is due, and describe the outcome.
+
+    Candidates are only asked about when there are any: an empty list has nothing
+    to choose from, and the reason it is empty is more useful than a prompt.
+    """
+    if not prompting or not candidates:
+        return Selection(songs=candidates, scope=scope, note=note)
+
+    picks = prompt_for_tracks(candidates)
+    return Selection(
+        songs=picks,
+        # "chosen track(s) from 3 candidate(s)" restates what the prompt showed.
+        scope=f"chosen track(s) from {len(candidates)} candidate(s)",
+        note="nothing was selected, so there is nothing to download",
+    )
+
+
+def _should_prompt(args: argparse.Namespace) -> bool:
+    """Whether to stop and ask which of the candidates to download.
+
+    Prompting needs a terminal, and is the default there. ``--all`` turns it
+    off; ``--pick`` insists on it, so an unattended ``--pick`` fails loudly
+    instead of quietly downloading everything.
+    """
+    if args.all:
+        return False
+    if args.pick:
+        if not _stdin_is_tty():
+            raise SelectionError(
+                "--pick needs a terminal to ask on: run it interactively, or use "
+                "--search/--artist/--album/--song-id, or drop --pick to take everything"
+            )
+        return True
+    return _stdin_is_tty()
+
+
+def _enumerate(
+    client: NavidromeClient, args: argparse.Namespace, *, whole_library: bool, complete: bool = False
+) -> list:
+    """List the candidate tracks for a scope.
+
+    ``complete`` forces the full walk, because a filter needs every track to
+    match against and the prompt must never be handed a list that is quietly
+    missing tracks. Otherwise ``--limit`` is allowed to stop the scan early,
+    which is the whole point of it on a large library.
+    """
+    if not whole_library:
+        return client.fetch_favorites()
+    return client.fetch_library(limit=0 if complete else max(args.limit, 0))
+
+
+def _select_by_song_id(client: NavidromeClient, song_ids: Sequence[str]) -> Selection:
+    songs: list = []
+    unresolved: list = []
+    for song_id in song_ids:
+        try:
+            song = client.fetch_song(song_id)
+        except SubsonicError as exc:
+            unresolved.append(song_id)
+            LOG.warning("Could not look up song %s: %s", song_id, exc)
+            continue
+        if song is None:
+            unresolved.append(song_id)
+            LOG.warning("No playable track with id %s", song_id)
+            continue
+        if song not in songs:
+            songs.append(song)
+
+    if not songs:
+        raise SelectionError(
+            "none of the requested song ids could be read: " + ", ".join(unresolved)
+        )
+    if unresolved:
+        LOG.warning("%d song id(s) could not be read: %s", len(unresolved), ", ".join(unresolved))
+    return Selection(
+        songs=songs,
+        scope=f"requested track(s) ({len(songs)} of {len(song_ids)} id(s))",
+        errors=len(unresolved),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1494,8 +1993,7 @@ class FavSyncer:
 
     # -- run loop ----------------------------------------------------------
 
-    def run(self, songs: Sequence) -> dict:
-        scope = "favorite track(s)" if self.args.favorites_only else "track(s) in the library"
+    def run(self, songs: Sequence, scope: str = "track(s)") -> dict:
         LOG.info("Found %d %s", len(songs), scope)
         results: list = []
         workers = max(1, self.args.workers)
@@ -1611,14 +2109,28 @@ def _format_bytes(count: int) -> str:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="navidrome_favsync",
-        description="Download tracks from Navidrome as transcoded Opus files (the whole library by default).",
+        description=(
+            "Download chosen tracks from Navidrome as transcoded Opus files. "
+            "In a terminal it asks which of the candidates you want; "
+            "pass a scope flag to choose up front."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 examples:
   navidrome_favsync.py --url https://music.example.com --user alice
+  navidrome_favsync.py --url https://music.example.com --user alice --all
+  navidrome_favsync.py --url https://music.example.com --user alice --search airbag
+  navidrome_favsync.py --url https://music.example.com --user alice --search airbag --pick
+  navidrome_favsync.py --url https://music.example.com --user alice --artist radiohead
+  navidrome_favsync.py --url https://music.example.com --user alice --song-id 0rVIJb7CSgetU1nTv0ARaF
   ND_URL=https://music.example.com navidrome_favsync.py --out ~/Music/music --workers 3
   navidrome_favsync.py --url https://music.example.com --user alice --favorites-only
   navidrome_favsync.py --url https://music.example.com --user alice --dry-run
+
+One scope flag per run: --favorites-only, --song-id, --search, --artist or
+--album. With none of them, the whole library is the candidate list and a
+terminal is asked which tracks to download; --all skips the question and
+--pick insists on it.
 
 The Navidrome server needs ffmpeg and an Opus target format in its transcoding
 configuration, otherwise it will stream the original files unchanged.
@@ -1631,7 +2143,19 @@ configuration, otherwise it will stream the original files unchanged.
                         help="Navidrome password (env: ND_PASSWORD; prefer the env var)")
     parser.add_argument("--out", default="music", help="output directory (default: ./music)")
     parser.add_argument("--favorites-only", action="store_true",
-                        help="download only starred tracks instead of the whole library")
+                        help="scope: download only starred tracks instead of the whole library")
+    parser.add_argument("--song-id", action="append", metavar="ID",
+                        help="scope: download these exact song ids (repeatable, or comma-separated)")
+    parser.add_argument("--search", metavar="QUERY",
+                        help="scope: download every track the server finds for QUERY (title/artist/album)")
+    parser.add_argument("--artist", metavar="TEXT",
+                        help="scope: download tracks whose artist contains TEXT (case-insensitive)")
+    parser.add_argument("--album", metavar="TEXT",
+                        help="scope: download tracks whose album contains TEXT (case-insensitive)")
+    parser.add_argument("--pick", action="store_true",
+                        help="ask which of the candidates to download, and fail without a terminal")
+    parser.add_argument("--all", action="store_true",
+                        help="never ask; take every candidate track (the default when there is no terminal)")
     parser.add_argument("--format", default="opus", help="target format requested from the server (default: opus)")
     parser.add_argument("--bitrate", type=int, default=192,
                         help=f"target bitrate in kbps, {MIN_OPUS_BITRATE}-{MAX_OPUS_BITRATE} (default: 192)")
@@ -1676,6 +2200,7 @@ def validate_args(args: argparse.Namespace) -> list:
         problems.append("--user is required (or set ND_USERNAME)")
     if args.password is None:
         problems.append("--password is required (or set ND_PASSWORD)")
+    problems.extend(validate_scope_args(args))
     if not MIN_OPUS_BITRATE <= args.bitrate <= MAX_OPUS_BITRATE:
         problems.append(f"--bitrate must be between {MIN_OPUS_BITRATE} and {MAX_OPUS_BITRATE} kbps")
     if args.retries < 1:
@@ -1686,6 +2211,33 @@ def validate_args(args: argparse.Namespace) -> list:
         problems.append("--timeout must be positive")
     if args.cover_size < 1:
         problems.append("--cover-size must be positive")
+    return problems
+
+
+def validate_scope_args(args: argparse.Namespace) -> list:
+    """Check that the run asks for exactly one thing, and that it is a real one.
+
+    One scope per run means a command can never mean two different things, and a
+    typo in a filter fails immediately instead of quietly matching everything.
+    ``--pick`` and ``--all`` are not scopes: they answer "should I ask?", and are
+    allowed with any scope -- except together, which is a contradiction.
+    """
+    problems = []
+    scopes = (
+        ("--favorites-only", args.favorites_only),
+        ("--song-id", args.song_id),
+        ("--search", args.search),
+        ("--artist", args.artist),
+        ("--album", args.album),
+    )
+    given = [flag for flag, value in scopes if value]
+    if len(given) > 1:
+        problems.append(f"choose one scope, not several: {' and '.join(given)}")
+    for flag, value in (("--search", args.search), ("--artist", args.artist), ("--album", args.album)):
+        if value is not None and not value.strip():
+            problems.append(f"{flag} needs a non-empty value")
+    if args.pick and args.all:
+        problems.append("--pick asks which tracks to download, so it cannot be combined with --all")
     return problems
 
 
@@ -1738,22 +2290,20 @@ def main(argv: Optional[list] = None) -> int:
         return 2
 
     try:
-        if args.favorites_only:
-            songs = client.fetch_favorites()
-        else:
-            songs = client.fetch_library(limit=max(args.limit, 0))
+        selection = resolve_scope(client, args)
+    except SelectionError as exc:
+        LOG.error("%s", exc)
+        return 2
     except SubsonicError as exc:
-        LOG.error("Could not fetch %s: %s", "favorites" if args.favorites_only else "the library", exc)
+        LOG.error("Could not work out which tracks to download: %s", exc)
         return 2
     except KeyboardInterrupt:
         LOG.warning("Aborted while listing tracks")
         return 130
 
+    songs = selection.songs
     if not songs:
-        if args.favorites_only:
-            LOG.info("No favorites found for user %r", args.user)
-        else:
-            LOG.info("No tracks found in the library visible to user %r", args.user)
+        LOG.info("%s", selection.note or "nothing to download")
         return 0
 
     if args.limit and args.limit > 0 and len(songs) > args.limit:
@@ -1764,7 +2314,7 @@ def main(argv: Optional[list] = None) -> int:
     _install_signal_handlers(syncer)
 
     try:
-        summary = syncer.run(songs)
+        summary = syncer.run(songs, selection.scope)
     except KeyboardInterrupt:
         LOG.warning("Aborted")
         return 130
@@ -1784,6 +2334,12 @@ def main(argv: Optional[list] = None) -> int:
         LOG.warning(
             "%d album(s) could not be listed, so those tracks are missing from this run",
             client.library_errors,
+        )
+        return 1
+    if selection.errors:
+        LOG.warning(
+            "%d requested song id(s) could not be read, so those tracks are missing from this run",
+            selection.errors,
         )
         return 1
     return 1 if summary["failed"] else 0
