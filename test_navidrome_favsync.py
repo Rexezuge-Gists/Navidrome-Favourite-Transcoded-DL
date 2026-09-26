@@ -713,10 +713,18 @@ USERNAME = "alice"
 COVER = make_jpeg(1000, 1000, payload_size=2000)
 
 
-def song_entry(song_id: str, title: str, track: int, album="Fixture Album", artist="Fixture Artist") -> dict:
+def song_entry(
+    song_id: str,
+    title: str,
+    track: int,
+    album="Fixture Album",
+    artist="Fixture Artist",
+    album_id="al-1",
+    cover_art="cover-1",
+) -> dict:
     return {
         "id": song_id,
-        "parent": "al-1",
+        "parent": album_id,
         "isDir": False,
         "title": title,
         "album": album,
@@ -730,12 +738,31 @@ def song_entry(song_id: str, title: str, track: int, album="Fixture Album", arti
         "contentType": "audio/flac",
         "duration": 245,
         "bitRate": 900,
-        "path": "/music/Fixture/" + title + ".flac",
-        "albumId": "al-1",
+        "path": f"/music/{album}/" + title + ".flac",
+        "albumId": album_id,
         "artistId": "ar-1",
-        "coverArt": "cover-1",
+        "coverArt": cover_art,
         "type": "music",
         "isVideo": False,
+    }
+
+
+def album_fixture(album_id, name, artist, tracks) -> dict:
+    """One entry for the mock's album list, as getAlbumList2 would report it."""
+    return {
+        "id": album_id,
+        "isDir": True,
+        "name": name,
+        "album": name,
+        "artist": artist,
+        "albumArtist": artist,
+        "songCount": len(tracks),
+        "duration": sum(t.get("duration", 0) for t in tracks),
+        "year": 2024,
+        "genre": "Test",
+        "coverArt": "cover-1",
+        "created": "2024-01-01T00:00:00Z",
+        "songs": tracks,
     }
 
 
@@ -819,6 +846,8 @@ class MockNavidromeHandler(http.server.BaseHTTPRequestHandler):
         handler = {
             "ping": self._handle_ping,
             "getStarred2": self._handle_starred,
+            "getAlbumList2": self._handle_album_list2,
+            "getAlbum": self._handle_album,
             "getCoverArt": self._handle_cover,
             "stream": self._handle_stream,
         }.get(endpoint)
@@ -841,6 +870,42 @@ class MockNavidromeHandler(http.server.BaseHTTPRequestHandler):
                 }
             }
         )
+
+    def _handle_album_list2(self, params):
+        if self.state["behaviours"].get("getAlbumList2") == "server-error":
+            self._subsonic_failed(0, "Internal Server Error: boom", status=500)
+            return
+        if params.get("type") != "alphabeticalByName":
+            self._subsonic_failed(0, f"unexpected album list type {params.get('type')}")
+            return
+        try:
+            size = int(params.get("size", 10))
+            offset = int(params.get("offset", 0))
+        except ValueError:
+            self._subsonic_failed(10, "size/offset must be integers")
+            return
+        window = self.state["albums"][offset : offset + size]
+        # A real server reports album metadata only; tracks come from getAlbum.
+        listed = [{key: value for key, value in album.items() if key != "songs"} for album in window]
+        self._subsonic_ok({"albumList2": {"album": listed}})
+
+    def _handle_album(self, params):
+        album_id = params.get("id", "")
+        behaviour = self.state["behaviours"].get(album_id)
+        if behaviour == "server-error":
+            self._subsonic_failed(0, "Internal Server Error: boom", status=500)
+            return
+        if behaviour == "gone":
+            self._subsonic_failed(70, "Album not found", status=404)
+            return
+        for album in self.state["albums"]:
+            if album["id"] != album_id:
+                continue
+            payload = {key: value for key, value in album.items() if key != "songs"}
+            payload["song"] = album["songs"]
+            self._subsonic_ok({"album": payload})
+            return
+        self._subsonic_failed(70, "Album not found", status=404)
 
     def _handle_cover(self, params):
         if params.get("size") != str(self.state["cover_size"]):
@@ -952,13 +1017,25 @@ class MockNavidromeHandler(http.server.BaseHTTPRequestHandler):
 
 
 class MockServer:
-    def __init__(self, library, behaviours=None, cover_size=1000, ratelimit_count=1):
+    def __init__(self, library, behaviours=None, cover_size=1000, ratelimit_count=1, albums=None):
         self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), MockNavidromeHandler)
         self.httpd.daemon_threads = True
         self.default_behaviours = dict(behaviours or {})
         self.default_ratelimit_count = ratelimit_count
         self.state = {
             "library": list(library),
+            # By default the library is a single album holding the starred tracks,
+            # so both download modes see the same fixture.
+            "albums": list(albums)
+            if albums is not None
+            else [
+                album_fixture(
+                    "al-1",
+                    "Fixture Album",
+                    "Fixture Artist",
+                    [song_entry(song_id, title, track) for song_id, title, track in library],
+                )
+            ],
             "behaviours": dict(self.default_behaviours),
             "opus": build_opus_stream(),
             "requests": [],
@@ -1001,12 +1078,15 @@ class MockServer:
 class EndToEndTestCase(unittest.TestCase):
     behaviours: dict = {}
     library = (("ok-1", "First Track", 1),)
+    albums: list = None
     extra_args: list = []
     ratelimit_count = 1
 
     @classmethod
     def setUpClass(cls):
-        cls.server = MockServer(cls.library, cls.behaviours, ratelimit_count=cls.ratelimit_count)
+        cls.server = MockServer(
+            cls.library, cls.behaviours, ratelimit_count=cls.ratelimit_count, albums=cls.albums
+        )
 
     @classmethod
     def tearDownClass(cls):
@@ -1123,6 +1203,186 @@ class TestHappyPath(EndToEndTestCase):
         self.assertEqual(statuses, ["downloaded", "downloaded"])
 
     def test_limit(self):
+        out = self.temp_dir()
+        self.assertEqual(self.run_script(out, "--limit", "1"), 0)
+        self.assertEqual(len(list(out.rglob("*.opus"))), 1)
+
+
+def multi_album_fixture():
+    """Two albums by different artists, of the kind only the album walk returns."""
+    return [
+        album_fixture(
+            "al-1",
+            "First Album",
+            "Artist One",
+            [
+                song_entry("ok-1", "One One", 1, "First Album", "Artist One", "al-1"),
+                song_entry("ok-2", "One Two", 2, "First Album", "Artist One", "al-1"),
+            ],
+        ),
+        album_fixture(
+            "al-2",
+            "Second Album",
+            "Artist Two",
+            [song_entry("ok-3", "Two One", 1, "Second Album", "Artist Two", "al-2", "cover-2")],
+        ),
+    ]
+
+
+class TestFullLibrary(EndToEndTestCase):
+    library = (("star-1", "Starred Only", 1),)
+    albums = multi_album_fixture()
+
+    def endpoints(self):
+        return [endpoint for endpoint, _params in self.server.state["requests"]]
+
+    def test_whole_library_is_downloaded_by_default(self):
+        out = self.temp_dir()
+        self.assertEqual(self.run_script(out), 0)
+
+        self.assertTrue((out / "Artist One - First Album" / "01 - One One.opus").is_file())
+        self.assertTrue((out / "Artist One - First Album" / "02 - One Two.opus").is_file())
+        self.assertTrue((out / "Artist Two - Second Album" / "01 - Two One.opus").is_file())
+        self.assertFalse((out / "Fixture Artist - Fixture Album").exists())
+        self.assertEqual(len(list(out.rglob("*.opus"))), 3)
+
+        endpoints = self.endpoints()
+        self.assertIn("getAlbumList2", endpoints)
+        self.assertNotIn("getStarred2", endpoints, "the whole library is the default, favorites are not consulted")
+        self.assertEqual(
+            [song_id for song_id, _fmt, _bitrate in self.server.state["stream_params"]],
+            ["ok-1", "ok-2", "ok-3"],
+        )
+
+    def test_manifest_covers_every_album(self):
+        out = self.temp_dir()
+        self.assertEqual(self.run_script(out), 0)
+        records = [json.loads(line) for line in (out / "manifest.jsonl").read_text().strip().splitlines()]
+        self.assertEqual(len(records), 3)
+        self.assertEqual(
+            sorted(record["album"] for record in records), ["First Album", "First Album", "Second Album"]
+        )
+        self.assertTrue(all(record["status"] == "downloaded" for record in records))
+
+    def test_favorites_only_ignores_the_rest_of_the_library(self):
+        out = self.temp_dir()
+        self.assertEqual(self.run_script(out, "--favorites-only"), 0)
+
+        self.assertTrue((out / "Fixture Artist - Fixture Album" / "01 - Starred Only.opus").is_file())
+        self.assertFalse((out / "Artist One - First Album").exists())
+        self.assertEqual(len(list(out.rglob("*.opus"))), 1)
+
+        endpoints = self.endpoints()
+        self.assertIn("getStarred2", endpoints)
+        self.assertNotIn("getAlbumList2", endpoints, "--favorites-only must not scan the library")
+        self.assertNotIn("getAlbum", endpoints, "--favorites-only must not scan the library")
+
+    def test_paging_covers_every_album(self):
+        original = navi.ALBUM_PAGE_SIZE
+        navi.ALBUM_PAGE_SIZE = 2
+        self.addCleanup(setattr, navi, "ALBUM_PAGE_SIZE", original)
+
+        out = self.temp_dir()
+        self.assertEqual(self.run_script(out), 0)
+        self.assertEqual(len(list(out.rglob("*.opus"))), 3)
+
+        album_pages = [params for endpoint, params in self.server.state["requests"] if endpoint == "getAlbumList2"]
+        self.assertEqual([(page["size"], page["offset"]) for page in album_pages], [("2", "0"), ("2", "2")])
+        album_reads = [params["id"] for endpoint, params in self.server.state["requests"] if endpoint == "getAlbum"]
+        self.assertEqual(album_reads, ["al-1", "al-2"])
+
+    def test_albums_with_no_playable_tracks_are_skipped(self):
+        self.server.state["albums"].append(
+            album_fixture("al-3", "Booklet", "Various", [{"id": "note-1", "isDir": False, "title": "Notes"}])
+        )
+        self.addCleanup(self.server.state["albums"].pop)
+
+        out = self.temp_dir()
+        self.assertEqual(self.run_script(out), 0)
+        self.assertEqual(len(list(out.rglob("*.opus"))), 3)
+        self.assertFalse((out / "Various - Booklet").exists())
+
+    def test_duplicate_tracks_are_only_downloaded_once(self):
+        self.server.state["albums"].append(
+            album_fixture(
+                "al-4",
+                "First Album (Compilation)",
+                "Artist One",
+                [song_entry("ok-1", "One One", 1, "First Album (Compilation)", "Artist One", "al-4")],
+            )
+        )
+        self.addCleanup(self.server.state["albums"].pop)
+
+        out = self.temp_dir()
+        self.assertEqual(self.run_script(out), 0)
+        self.assertEqual(len(list(out.rglob("*.opus"))), 3)
+        self.assertEqual(
+            sorted(song_id for song_id, _fmt, _bitrate in self.server.state["stream_params"]),
+            ["ok-1", "ok-2", "ok-3"],
+        )
+
+    def test_limit_stops_the_scan_early(self):
+        out = self.temp_dir()
+        self.assertEqual(self.run_script(out, "--limit", "1"), 0)
+        self.assertEqual(len(list(out.rglob("*.opus"))), 1)
+        self.assertEqual(
+            [params["id"] for endpoint, params in self.server.state["requests"] if endpoint == "getAlbum"],
+            ["al-1"],
+            "--limit must not keep reading albums once it has enough tracks",
+        )
+
+    def test_unreadable_album_is_skipped_and_reported(self):
+        self.stub(**{"al-2": "server-error"})
+        out = self.temp_dir()
+        code = self.run_script(out)
+        self.assertEqual(code, 1, "an incomplete mirror has to be visible in the exit code")
+
+        self.assertTrue((out / "Artist One - First Album" / "01 - One One.opus").is_file())
+        self.assertEqual(len(list(out.rglob("*.opus"))), 2)
+
+    def test_vanished_album_is_skipped(self):
+        self.stub(**{"al-2": "gone"})
+        out = self.temp_dir()
+        self.assertEqual(self.run_script(out), 1)
+        self.assertEqual(len(list(out.rglob("*.opus"))), 2)
+
+    def test_album_list_failure_stops_before_downloading(self):
+        self.stub(**{"getAlbumList2": "server-error"})
+        out = self.temp_dir()
+        self.assertEqual(self.run_script(out), 2)
+        self.assertEqual(list(out.rglob("*")), [])
+
+
+class TestEmptyLibrary(EndToEndTestCase):
+    library = ()
+    albums = []
+
+    def test_no_tracks_exits_cleanly(self):
+        out = self.temp_dir()
+        self.assertEqual(self.run_script(out), 0)
+        self.assertFalse((out / "manifest.jsonl").exists())
+
+    def test_no_favorites_exits_cleanly(self):
+        out = self.temp_dir()
+        self.assertEqual(self.run_script(out, "--favorites-only"), 0)
+        self.assertFalse((out / "manifest.jsonl").exists())
+
+
+class TestFavoritesOnlyHappyPath(EndToEndTestCase):
+    library = (("ok-1", "First Track", 1), ("ok-2", "Second Track", 2))
+    albums = multi_album_fixture()
+    extra_args = ["--favorites-only"]
+
+    def test_only_starred_tracks_are_downloaded(self):
+        out = self.temp_dir()
+        self.assertEqual(self.run_script(out), 0)
+        album = out / "Fixture Artist - Fixture Album"
+        self.assertTrue((album / "01 - First Track.opus").is_file())
+        self.assertTrue((album / "02 - Second Track.opus").is_file())
+        self.assertEqual(len(list(out.rglob("*.opus"))), 2)
+        self.assertNotIn("getAlbumList2", [endpoint for endpoint, _ in self.server.state["requests"]])
+
+    def test_limit_applies_to_favorites(self):
         out = self.temp_dir()
         self.assertEqual(self.run_script(out, "--limit", "1"), 0)
         self.assertEqual(len(list(out.rglob("*.opus"))), 1)
@@ -1338,15 +1598,6 @@ class TestAuth(EndToEndTestCase):
         self.assertEqual(code, 0)
 
 
-class TestEmptyLibrary(EndToEndTestCase):
-    library = ()
-
-    def test_no_favorites_exits_cleanly(self):
-        out = self.temp_dir()
-        self.assertEqual(self.run_script(out), 0)
-        self.assertFalse((out / "manifest.jsonl").exists())
-
-
 class TestArgumentValidation(unittest.TestCase):
     def test_missing_required(self):
         self.assertEqual(navi.main(["--log-level", "CRITICAL"]), 2)
@@ -1373,6 +1624,18 @@ class TestArgumentValidation(unittest.TestCase):
         args = navi.build_parser().parse_args(["--url", "music.example.com", "--user", "a", "--password", "b"])
         navi.validate_args(args)
         self.assertFalse("://" in args.url)
+
+    def test_defaults(self):
+        args = navi.build_parser().parse_args(["--url", "http://x", "--user", "a", "--password", "b"])
+        self.assertEqual(navi.validate_args(args), [])
+        self.assertEqual(args.out, "music")
+        self.assertFalse(args.favorites_only, "the whole library is the default scope")
+
+    def test_favorites_only_flag(self):
+        args = navi.build_parser().parse_args(
+            ["--url", "http://x", "--user", "a", "--password", "b", "--favorites-only"]
+        )
+        self.assertTrue(args.favorites_only)
 
 
 if __name__ == "__main__":

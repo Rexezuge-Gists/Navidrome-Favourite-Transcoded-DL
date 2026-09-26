@@ -1,9 +1,11 @@
 # navidrome_favsync
 
-Download the songs you've favorited in [Navidrome](https://www.navidrome.org) as
-Opus files, transcoded on the server to a bitrate you choose.
+Download your [Navidrome](https://www.navidrome.org) library as Opus files,
+transcoded on the server to a bitrate you choose. The whole library is mirrored
+by default; `--favorites-only` narrows it to the tracks you've starred.
 
-- Fetches your favorites and saves them as `Artist - Album/NN - Title.opus`
+- Walks every album in the library and saves tracks as `Artist - Album/NN - Title.opus`
+- `--favorites-only` downloads just your starred tracks instead
 - Asks the server for a real Opus transcode, and **refuses** to save a FLAC wearing
   an `.opus` extension
 - Saves a `cover.jpg` per album *and* embeds the artwork into each `.opus` file
@@ -67,7 +69,7 @@ Then for real:
   --url https://navi.550441.xyz \
   --user test \
   --password 'your-password' \
-  --out ~/Music/favorites
+  --out ~/Music
 ```
 
 Keeping the password out of your shell history and out of `ps` output is nicer:
@@ -76,20 +78,55 @@ Keeping the password out of your shell history and out of `ps` output is nicer:
 export ND_URL=https://navi.550441.xyz
 export ND_USERNAME=test
 export ND_PASSWORD='your-password'      # or: read -rs ND_PASSWORD
-./navidrome_favsync.py --out ~/Music/favorites
+./navidrome_favsync.py --out ~/Music
+```
+
+Just the starred tracks, as before:
+
+```bash
+./navidrome_favsync.py --favorites-only --out ~/Music/favorites
 ```
 
 A scheduled sync, e.g. nightly at 4am:
 
 ```cron
 17 4 * * * ND_URL=https://navi.550441.xyz ND_USERNAME=test ND_PASSWORD=... \
-           /path/to/navidrome_favsync.py --out /srv/music/favorites >> /var/log/favsync.log 2>&1
+           /path/to/navidrome_favsync.py --out /srv/music >> /var/log/favsync.log 2>&1
 ```
+
+## What gets downloaded
+
+By default: **every track in every album the account can see**. The script
+enumerates the library before downloading anything:
+
+1. `getAlbumList2` with `type=alphabeticalByName` pages through the albums, 500
+   at a time
+2. one `getAlbum` call per album returns that album's tracks
+
+So the scan costs one extra small JSON request per album, negligible next to
+streaming a full transcode of every track. What it buys is completeness:
+`getAlbum` returns a whole album in a single response, so a big library can't
+lose tracks to a paging gap the way paging songs by offset can.
+
+A few things worth knowing about a large library:
+
+- The scan logs progress (`Enumerated 500 album(s), 7421 track(s) so far`) every
+  25 albums, so a slow start is visible rather than looking hung
+- `Ctrl-C` during the scan aborts cleanly with exit code `130`
+- An album that can't be listed is logged, counted, and skipped — the rest of the
+  run continues, and the exit code is `1` so you know the mirror is incomplete
+- Albums added *while* a long run is in progress may fall into a shifted page and
+  be missed. Run it again; already-downloaded tracks are skipped, so that's cheap
+- `--limit N` stops the scan as soon as `N` tracks have been collected, so
+  `--limit 1` doesn't walk the whole library
+
+`--favorites-only` uses `getStarred2` instead and downloads the starred tracks
+only, which is instant regardless of library size.
 
 ## What you get
 
 ```
-favorites/
+music/
 ├── Miles Davis - Kind of Blue/
 │   ├── cover.jpg
 │   ├── 01 - So What.opus
@@ -131,7 +168,8 @@ Use `--no-embed` to keep `cover.jpg` but leave the `.opus` files alone, or
 | `--url` | `$ND_URL` | Navidrome base URL. `https://` is assumed if omitted |
 | `--user` | `$ND_USERNAME` | Username (alias: `--username`) |
 | `--password` | `$ND_PASSWORD` | Password. Prefer the env var |
-| `--out DIR` | `./favorites` | Where to write files |
+| `--out DIR` | `./music` | Where to write files |
+| `--favorites-only` | off | Download only starred tracks instead of the whole library |
 | `--format` | `opus` | Target format to request (see Limitations) |
 | `--bitrate` | `192` | Target bitrate in kbps, 6–256 |
 | `--workers N` | `1` | Parallel downloads. Each spawns an ffmpeg transcode **on the server** |
@@ -141,7 +179,7 @@ Use `--no-embed` to keep `cover.jpg` but leave the `.opus` files alone, or
 | `--no-cover` | off | Don't fetch or save artwork |
 | `--no-embed` | off | Save `cover.jpg` but don't embed it |
 | `--force` | off | Re-download files that already exist |
-| `--limit N` | `0` | Only process the first N favorites (`0` = all) |
+| `--limit N` | `0` | Only process the first N tracks found (`0` = all) |
 | `--dry-run` | off | Show what would happen; write nothing |
 | `--insecure` | off | Skip TLS certificate verification (self-signed certs) |
 | `--manifest-name` | `manifest.jsonl` | Manifest filename inside `--out` |
@@ -184,6 +222,7 @@ end you get a summary, and the exit code tells you whether it was clean.
 | HTTP 404 on a track | Not retried — the track is gone |
 | Server returns FLAC/MP3 instead of Opus | Not retried — see Troubleshooting |
 | Empty response | Retried |
+| An album can't be listed | Logged and skipped; the run continues and exits `1` |
 
 `--retries` bounds all of this per track. Backoff is randomised so parallel
 workers don't resynchronise into a thundering herd.
@@ -191,12 +230,13 @@ workers don't resynchronise into a thundering herd.
 ### Sample run
 
 Real output, with the server line from a live run against Navidrome 0.64.2 and the
-rest captured from the test suite. Track 2 hits the server's concurrent-transcode
-limit and recovers; track 3 hits the misconfiguration described above.
+rest captured from the test suite. The scan logs every 25 albums, so a three-album
+library stays quiet. Track 2 hits the server's concurrent-transcode limit and
+recovers; track 3 hits the misconfiguration described above.
 
 ```
 12:15:09 INFO    Connected to https://navi.550441.xyz (Navidrome 0.64.2, API navidrome)
-12:15:09 INFO    Found 3 favorite track(s)
+12:15:09 INFO    Found 3 track(s) in the library
 12:15:09 INFO    [1/3] Artist - 白夜
 12:15:09 INFO    Saved cover.jpg (2.0 KiB)
 12:15:09 INFO    Downloaded Artist - 白夜 (5.6 MiB)
@@ -232,14 +272,17 @@ immediately without waiting for the summary.
 12:14:09 INFO    Done: 0 downloaded, 0 skipped, 1 failed (of 4)
 ```
 
+During the library scan, which happens before any download, `Ctrl-C` instead
+prints `Aborted while listing tracks` and exits `130`.
+
 ## Exit codes
 
 | Code | Meaning |
 |---|---|
 | `0` | Everything succeeded (or nothing to do) |
-| `1` | At least one track failed — including the track interrupted by `Ctrl-C` |
-| `2` | Couldn't start: bad arguments, wrong credentials, server unreachable |
-| `130` | Force-aborted with a second `Ctrl-C` |
+| `1` | At least one track failed — including the track interrupted by `Ctrl-C`, or an album that couldn't be listed |
+| `2` | Couldn't start: bad arguments, wrong credentials, server unreachable, album list unavailable |
+| `130` | Force-aborted with a second `Ctrl-C`, or during the library scan |
 
 Useful in scripts: `navidrome_favsync.py ... || echo "some tracks failed, see the log"`.
 
@@ -263,7 +306,7 @@ download is all there.
 
 ```bash
 # what failed, and why
-jq -r 'select(.status=="failed") | "\(.artist) - \(.title): \(.error)"' favorites/manifest.jsonl
+jq -r 'select(.status=="failed") | "\(.artist) - \(.title): \(.error)"' music/manifest.jsonl
 ```
 
 ## Troubleshooting
@@ -291,10 +334,30 @@ per IP *and* username, so repeatedly guessing just gets you throttled — wait a
 few seconds. Also confirm you're pointed at the right URL; a reverse proxy with
 a path prefix needs that prefix included, e.g. `https://host/music`.
 
+**`No tracks found in the library`**
+
+The API returned an empty library for this account. Check that the username is
+the one you actually use in Navidrome, that it has access to at least one music
+folder, and that the server has finished scanning it.
+
 **`No favorites found`**
 
-The account genuinely has nothing starred — the API returned an empty list.
+Only possible with `--favorites-only`: the account genuinely has nothing starred.
 Star something in Navidrome and try again.
+
+**A full run spends a long time before the first download**
+
+That's the library scan — one `getAlbum` request per album, every album in the
+library, including the ones you've already downloaded. It's only slow the first
+time: `Enumerated 500 album(s), 7421 track(s) so far` tells you where it is. Use
+`--limit N` to take a short sample, or `--favorites-only` if you only want the
+starred tracks.
+
+**Tracks are skipped with no title, or `Unknown Title` everywhere**
+
+Navidrome's `Subsonic.MinimalClients` config strips everything but id and title
+for listed client names. If this script's client name ended up in that list,
+check `Settings -> Subsonic`.
 
 **`429` errors that never clear**
 
@@ -318,7 +381,9 @@ there is no native streaming endpoint — so the script speaks Subsonic end to e
 | Call | Purpose |
 |---|---|
 | `ping` | Validate URL and credentials before doing any work |
-| `getStarred2` | Your favorite tracks |
+| `getAlbumList2` | Page through every album the account can see |
+| `getAlbum` | The tracks of one album |
+| `getStarred2` | Your favorite tracks, with `--favorites-only` |
 | `getCoverArt` | One cover per album, reused across its tracks |
 | `stream` | The audio, with `format=opus&maxBitRate=192` |
 
@@ -346,7 +411,10 @@ makes a *complete* file structurally distinguishable from a cut-off one.
   track. Keep the default.
 - **Metadata is preserved but not extended.** Tags come from the server's
   transcode; the script only adds cover art.
-- **Single library per account.** It syncs whatever the authenticated user can see.
+- **Nothing is deleted.** Removed albums, and tracks un-starred between runs, stay
+  on disk. This only ever adds files.
+- **Multi-library accounts get everything they're allowed to see.** There's no
+  `--music-folder` to pick one library; the scan covers all of them.
 - **Not a two-way sync.** Nothing is ever un-favorited or deleted on the server.
 
 ## Tests
@@ -355,13 +423,18 @@ makes a *complete* file structurally distinguishable from a cut-off one.
 python3 -m unittest test_navidrome_favsync -v
 ```
 
-91 tests, no network access required, about 10 seconds. They cover:
+106 tests, no network access required, about 10 seconds. They cover:
 
 - The Ogg CRC against an independent bitwise reference **and** against real `.oga`
   files from the system sound theme
 - Cover embedding across JPEG, PNG and all three WebP flavours, including
   artwork large enough to force a multi-page comment header
 - Proof that audio bytes survive embedding unchanged
+- Library enumeration: every album downloaded by default, multi-page
+  `getAlbumList2` offsets, duplicate tracks collapsed, albums with no playable
+  tracks skipped, `--limit` stopping the scan early, an unreadable album skipped
+  while the run reports exit code `1`, and `--favorites-only` never touching the
+  album endpoints
 - A mock Navidrome server that misbehaves on cue: 429s, lying `Content-Length`,
   mid-transfer disconnects, HTTP 200 carrying an error document, empty bodies,
   and streaming the original file instead of a transcode

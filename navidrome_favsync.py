@@ -1,13 +1,23 @@
 #!/usr/bin/env python3
-"""Download favorited tracks from a Navidrome server as transcoded Opus files.
+"""Download a Navidrome library as transcoded Opus files.
+
+Every track in the library the account can see is downloaded by default; pass
+``--favorites-only`` for just the starred ones.
 
 Navidrome only exposes transcoded audio through the Subsonic API (``/rest``), so
 this script speaks that protocol end to end:
 
   * ``ping``          - validate the URL and credentials before doing any work
-  * ``getStarred2``   - the account's favorite tracks
+  * ``getAlbumList2`` - page through every album (``alphabeticalByName``)
+  * ``getAlbum``      - the tracks of one album
+  * ``getStarred2``   - the account's favorite tracks (``--favorites-only``)
   * ``getCoverArt``   - one album cover per album, reused across its tracks
   * ``stream``        - the audio, transcoded server side to Opus at a bitrate
+
+Enumerating the library costs one ``getAlbum`` request per album, which is
+cheap next to streaming a full transcode of every track, and it is what makes
+the list complete: ``getAlbum`` returns an album's tracks without a page limit,
+so nothing can fall through a paging gap.
 
 Authentication uses the Subsonic token scheme (``t=md5(password+salt)``) so the
 plaintext password never appears in a URL, and therefore never lands in a
@@ -66,6 +76,15 @@ MAX_NAME_LEN = 120
 PARTIAL_SUFFIX = ".part"
 DEFAULT_COVER_SIZE = 1000
 COVER_FILENAME = "cover.jpg"
+
+# getAlbumList2 rejects more than 500 per page, so that is the largest window
+# available for walking the library.
+ALBUM_PAGE_SIZE = 500
+# 1000 pages is 500k albums; purely a guard against a server that never returns
+# a short page and would otherwise loop forever.
+MAX_ALBUM_PAGES = 1000
+# Scanning a large library is slow, so say something while it happens.
+ALBUM_PROGRESS_EVERY = 25
 
 # Transient conditions worth another attempt.
 RETRYABLE_HTTP_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
@@ -769,6 +788,24 @@ def _describe(song: dict) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _as_entries(value: Any) -> list:
+    """Subsonic collapses single-element lists into a bare object; undo that."""
+    if isinstance(value, dict):
+        return [value]
+    if not value:
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _playable_songs(value: Any) -> list:
+    """Keep only real tracks: no directories, no entries missing a file suffix."""
+    return [
+        song
+        for song in _as_entries(value)
+        if song.get("id") and not song.get("isDir") and song.get("suffix")
+    ]
+
+
 def _md5_hex(data: bytes) -> str:
     try:
         return hashlib.md5(data, usedforsecurity=False).hexdigest()
@@ -802,7 +839,7 @@ def redact_url(url: str) -> str:
 
 
 class NavidromeClient:
-    """Minimal Subsonic API client covering the four calls this script needs."""
+    """Minimal Subsonic API client covering the calls this script needs."""
 
     def __init__(
         self,
@@ -817,6 +854,8 @@ class NavidromeClient:
         self.username = username
         self._password = password
         self.timeout = timeout
+        # Albums that could not be listed during the last fetch_library() call.
+        self.library_errors = 0
         handlers = []
         if insecure:
             context = ssl.create_default_context()
@@ -948,15 +987,86 @@ class NavidromeClient:
     def fetch_favorites(self) -> list:
         response = self.call("getStarred2")
         starred = response.get("starred2") or {}
-        songs = starred.get("song") or []
-        if isinstance(songs, dict):
-            songs = [songs]
         # getStarred2 also returns starred artists and albums; keep only real tracks.
-        tracks = [
-            song
-            for song in songs
-            if isinstance(song, dict) and song.get("id") and not song.get("isDir") and song.get("suffix")
-        ]
+        return _playable_songs(starred.get("song"))
+
+    def iter_albums(self) -> Iterator[dict]:
+        """Yield every album the account can see, one ``getAlbumList2`` page at a time."""
+        offset = 0
+        for _page in range(MAX_ALBUM_PAGES):
+            response = self.call(
+                "getAlbumList2",
+                {
+                    "type": "alphabeticalByName",
+                    "size": str(ALBUM_PAGE_SIZE),
+                    "offset": str(offset),
+                },
+            )
+            albums = _as_entries((response.get("albumList2") or {}).get("album"))
+            if not albums:
+                return
+            for album in albums:
+                if album.get("id"):
+                    yield album
+            # A short page means the library ends here.
+            if len(albums) < ALBUM_PAGE_SIZE:
+                return
+            offset += ALBUM_PAGE_SIZE
+        LOG.warning(
+            "Stopped after %d album pages (%d albums); the library may be bigger than that",
+            MAX_ALBUM_PAGES,
+            MAX_ALBUM_PAGES * ALBUM_PAGE_SIZE,
+        )
+
+    def fetch_album_songs(self, album_id: str) -> list:
+        """Return every playable track of one album."""
+        response = self.call("getAlbum", {"id": album_id})
+        return _playable_songs((response.get("album") or {}).get("song"))
+
+    def fetch_library(self, limit: int = 0) -> list:
+        """Enumerate every track in the library.
+
+        Albums are paged with ``getAlbumList2`` and expanded with ``getAlbum``,
+        which returns a whole album in one response and therefore cannot leave a
+        gap in the middle of a large library the way paging songs can.
+
+        A single album that cannot be read is logged and counted in
+        ``library_errors`` rather than failing the whole run; only a failure of
+        the album list itself propagates. ``limit`` stops the scan as soon as
+        enough tracks have been collected.
+        """
+        self.library_errors = 0
+        tracks: list = []
+        seen: set = set()
+        albums = 0
+
+        for album in self.iter_albums():
+            albums += 1
+            album_name = str(album.get("name") or album.get("album") or "?")
+            try:
+                songs = self.fetch_album_songs(str(album["id"]))
+            except SubsonicError as exc:
+                self.library_errors += 1
+                LOG.warning("Skipping album %s: %s", album_name, exc)
+                continue
+            for song in songs:
+                song_id = str(song["id"])
+                if song_id in seen:
+                    # The same track can be listed twice when albums move
+                    # between scans; a track is only ever downloaded once.
+                    continue
+                seen.add(song_id)
+                tracks.append(song)
+            if albums % ALBUM_PROGRESS_EVERY == 0:
+                LOG.info("Enumerated %d album(s), %d track(s) so far", albums, len(tracks))
+            if limit and limit > 0 and len(tracks) >= limit:
+                LOG.info("Stopping the scan at %d track(s) (--limit)", limit)
+                return tracks[:limit]
+
+        if self.library_errors:
+            LOG.warning(
+                "%d of %d album(s) could not be listed and were skipped", self.library_errors, albums
+            )
         return tracks
 
     def fetch_cover_art(self, cover_id: str, size: int) -> bytes:
@@ -1385,7 +1495,8 @@ class FavSyncer:
     # -- run loop ----------------------------------------------------------
 
     def run(self, songs: Sequence) -> dict:
-        LOG.info("Found %d favorite track(s)", len(songs))
+        scope = "favorite track(s)" if self.args.favorites_only else "track(s) in the library"
+        LOG.info("Found %d %s", len(songs), scope)
         results: list = []
         workers = max(1, self.args.workers)
 
@@ -1500,15 +1611,16 @@ def _format_bytes(count: int) -> str:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="navidrome_favsync",
-        description="Download favorited tracks from Navidrome as transcoded Opus files.",
+        description="Download tracks from Navidrome as transcoded Opus files (the whole library by default).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 examples:
   navidrome_favsync.py --url https://music.example.com --user alice
-  ND_URL=https://music.example.com navidrome_favsync.py --out ~/Music/favs --workers 3
+  ND_URL=https://music.example.com navidrome_favsync.py --out ~/Music/music --workers 3
+  navidrome_favsync.py --url https://music.example.com --user alice --favorites-only
   navidrome_favsync.py --url https://music.example.com --user alice --dry-run
 
-The Navidrome server needs ffmpeg and an Opus entry in its transcoding
+The Navidrome server needs ffmpeg and an Opus target format in its transcoding
 configuration, otherwise it will stream the original files unchanged.
 """,
     )
@@ -1517,7 +1629,9 @@ configuration, otherwise it will stream the original files unchanged.
                         help="Navidrome username (env: ND_USERNAME)")
     parser.add_argument("--password", default=os.environ.get("ND_PASSWORD"),
                         help="Navidrome password (env: ND_PASSWORD; prefer the env var)")
-    parser.add_argument("--out", default="favorites", help="output directory (default: ./favorites)")
+    parser.add_argument("--out", default="music", help="output directory (default: ./music)")
+    parser.add_argument("--favorites-only", action="store_true",
+                        help="download only starred tracks instead of the whole library")
     parser.add_argument("--format", default="opus", help="target format requested from the server (default: opus)")
     parser.add_argument("--bitrate", type=int, default=192,
                         help=f"target bitrate in kbps, {MIN_OPUS_BITRATE}-{MAX_OPUS_BITRATE} (default: 192)")
@@ -1530,7 +1644,8 @@ configuration, otherwise it will stream the original files unchanged.
     parser.add_argument("--no-cover", action="store_true", help="do not fetch or save cover art")
     parser.add_argument("--no-embed", action="store_true", help="save cover.jpg but do not embed it in the Opus file")
     parser.add_argument("--force", action="store_true", help="re-download tracks that already exist")
-    parser.add_argument("--limit", type=int, default=0, help="only process the first N favorites (0 = all)")
+    parser.add_argument("--limit", type=int, default=0,
+                        help="only process the first N tracks found (0 = all); stops the library scan early")
     parser.add_argument("--dry-run", action="store_true", help="list what would be downloaded and exit")
     parser.add_argument("--insecure", action="store_true", help="skip TLS certificate verification")
     parser.add_argument("--manifest-name", default="manifest.jsonl", help="manifest filename inside --out")
@@ -1623,17 +1738,26 @@ def main(argv: Optional[list] = None) -> int:
         return 2
 
     try:
-        songs = client.fetch_favorites()
+        if args.favorites_only:
+            songs = client.fetch_favorites()
+        else:
+            songs = client.fetch_library(limit=max(args.limit, 0))
     except SubsonicError as exc:
-        LOG.error("Could not fetch favorites: %s", exc)
+        LOG.error("Could not fetch %s: %s", "favorites" if args.favorites_only else "the library", exc)
         return 2
+    except KeyboardInterrupt:
+        LOG.warning("Aborted while listing tracks")
+        return 130
 
     if not songs:
-        LOG.info("No favorites found for user %r", args.user)
+        if args.favorites_only:
+            LOG.info("No favorites found for user %r", args.user)
+        else:
+            LOG.info("No tracks found in the library visible to user %r", args.user)
         return 0
 
-    if args.limit and args.limit > 0:
-        LOG.info("Limiting run to the first %d of %d favorites (--limit)", args.limit, len(songs))
+    if args.limit and args.limit > 0 and len(songs) > args.limit:
+        LOG.info("Limiting run to the first %d of %d track(s) (--limit)", args.limit, len(songs))
         songs = songs[: args.limit]
 
     syncer = FavSyncer(client, args)
@@ -1656,6 +1780,12 @@ def main(argv: Optional[list] = None) -> int:
         LOG.warning("%d track(s) failed:", len(summary["failures"]))
         for failure in summary["failures"]:
             LOG.warning("  %s -> %s", failure["track"], failure["error"])
+    if client.library_errors:
+        LOG.warning(
+            "%d album(s) could not be listed, so those tracks are missing from this run",
+            client.library_errors,
+        )
+        return 1
     return 1 if summary["failed"] else 0
 
 
